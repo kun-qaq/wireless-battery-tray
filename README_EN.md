@@ -6,6 +6,8 @@ It ships with Akko S9 Ultra, Lingbao K98 and Logitech G304, but **those are just
 
 > 中文版请见 [README.md](README.md) — Chinese version.
 
+**Prefer a ready-to-run binary?** Grab `WirelessBatteryTray.exe` from [Releases](https://github.com/kun-qaq/wireless-battery-tray/releases) — double-click, no Python needed.
+
 Platform: Windows 10 / 11
 
 ## Built-in Devices (Examples Only)

@@ -6,6 +6,8 @@
 
 平台：Windows 10 / 11
 
+**不想自己打包？** 到 [Releases](https://github.com/kun-qaq/wireless-battery-tray/releases) 下载 `WirelessBatteryTray.exe`，双击即用。
+
 > English version: [README_EN.md](README_EN.md)（英文版随主版本更新，可能略有滞后）
 
 ## 内置支持的设备（示例）
