@@ -6,6 +6,8 @@
 
 平台：Windows 10 / 11
 
+> English version: [README_EN.md](README_EN.md)（英文版随主版本更新，可能略有滞后）
+
 ## 内置支持的设备（示例）
 
 | 设备 | 连接方式 | 读取原理 |
