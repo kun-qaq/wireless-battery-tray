@@ -37,6 +37,19 @@ LOGI_VID, LOGI_PID = 0x046D, 0xC53F
 
 APP_NAME = "WirelessBatteryTray"
 
+# ----------------------------- 运行日志 -----------------------------
+# 写到 %TEMP%\WirelessBatteryTray.log，排查「读不到/显示离线」时先看这里
+LOG_PATH = os.path.join(os.environ.get("TEMP") or ".", "WirelessBatteryTray.log")
+
+
+def log(msg):
+    try:
+        with open(LOG_PATH, "a", encoding="utf-8") as f:
+            f.write("[%s] %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg))
+    except Exception:
+        pass
+
+
 # ----------------------------- 通用 HID 工具 -----------------------------
 
 def find_path(vid, pid, usage_page, usage):
@@ -46,10 +59,13 @@ def find_path(vid, pid, usage_page, usage):
     return None
 
 
-def open_or(dev, vid, pid, usage_page, usage):
-    """返回已打开的 device；失败/设备变化时重开。"""
-    if dev is not None:
-        return dev
+def open_fresh(vid, pid, usage_page, usage):
+    """每次都重新枚举并打开一个新句柄。
+
+    刻意不长期持有句柄：设备休眠/重连/系统睡眠恢复后，旧句柄会失效，
+    继续读写容易在 hidapi 的 C 层直接崩掉（Python 层捕获不到）。
+    打开开销是毫秒级，30 秒一轮完全无感。
+    """
     path = find_path(vid, pid, usage_page, usage)
     if not path:
         return None
@@ -58,8 +74,15 @@ def open_or(dev, vid, pid, usage_page, usage):
         d.open_path(path)
         d.set_nonblocking(1)
         return d
-    except OSError:
+    except Exception:
         return None
+
+
+def close_safe(dev):
+    try:
+        dev.close()
+    except Exception:
+        pass
 
 
 def drain(dev, secs=0.05):
@@ -85,25 +108,31 @@ class AkkoReader:
 
     def __init__(self):
         self.dev = None
+        self.fails = 0      # 连续失败次数，超过阈值强制重连
 
     def read(self):
+        dev = open_fresh(AKKO_VID, AKKO_PID, 0x008C, 0x0001)
+        if not dev:
+            self.fails += 1
+            log("AKKO: 找不到接口 (fails=%d)" % self.fails)
+            return None, "未连接"
         try:
-            self.dev = open_or(self.dev, AKKO_VID, AKKO_PID, 0x008C, 0x0001)
-            if not self.dev:
-                return None, "未连接"
-            for _ in range(12):
+            for _ in range(20):
                 try:
-                    self.dev.write(AKKO_QUERY)
-                except Exception:
-                    self.dev.close()
-                    self.dev = None
-                    return None, "通信失败"
-                for r in drain(self.dev, 0.05):
+                    dev.write(AKKO_QUERY)
+                except Exception as e:
+                    log("AKKO: 写入失败 %s" % e)
+                    break
+                for r in drain(dev, 0.08):
                     if len(r) >= 5 and r[1] == 0x12 and r[2] == 0x01:
+                        self.fails = 0
+                        log("AKKO: 电量 %d%%" % r[4])
                         return r[4], "电量"
+            self.fails += 1
+            log("AKKO: 无响应 (fails=%d)" % self.fails)
             return None, "无响应"
-        except Exception as e:
-            return None, f"错误 {e}"
+        finally:
+            close_safe(dev)
 
 # ----------------------------- 灵豹 K98 -----------------------------
 
@@ -112,24 +141,30 @@ class K98Reader:
 
     def __init__(self):
         self.dev = None
+        self.fails = 0
 
     def read(self):
+        dev = open_fresh(KB_VID, KB_PID, 0xFF04, 0x0002)
+        if not dev:
+            self.fails += 1
+            log("K98: 找不到接口 (fails=%d)" % self.fails)
+            return None, "未连接"
         try:
-            self.dev = open_or(self.dev, KB_VID, KB_PID, 0xFF04, 0x0002)
-            if not self.dev:
-                return None, "未连接"
-            try:
-                data = bytes(self.dev.get_feature_report(0x06, 65))
-            except Exception:
-                self.dev.close()
-                self.dev = None
-                return None, "通信失败"
-            # 06 <ch> <state> <kb%> <ch2%> <ch3%> <crc...>
-            if len(data) >= 6 and data[0] == 0x06:
-                return data[3], "电量"
-            return None, "无响应"
+            data = bytes(dev.get_feature_report(0x06, 65))
         except Exception as e:
-            return None, f"错误 {e}"
+            self.fails += 1
+            log("K98: 读取失败 %s" % e)
+            return None, "通信失败"
+        finally:
+            close_safe(dev)
+        # 06 <ch> <state> <kb%> <ch2%> <ch3%> <crc...>
+        if len(data) >= 6 and data[0] == 0x06:
+            self.fails = 0
+            log("K98: 电量 %d%%" % data[3])
+            return data[3], "电量"
+        self.fails += 1
+        log("K98: 无响应 (fails=%d)" % self.fails)
+        return None, "无响应"
 
 # ----------------------------- 罗技 G304 (HID++ 2.0) -----------------------------
 
@@ -140,10 +175,11 @@ class G304Reader:
     def __init__(self):
         self.dev = None
         self.feat_idx = None
+        self.fails = 0
 
     def _open(self):
         # 关键：HID++ 长报文 (report 0x11, 20 字节) 只能写到 usage 0x0002 的接口
-        self.dev = open_or(self.dev, LOGI_VID, LOGI_PID, 0xFF00, 0x0002)
+        self.dev = open_fresh(LOGI_VID, LOGI_PID, 0xFF00, 0x0002)
         return self.dev
 
     def _req(self, di, feature_index, function, params=b"", wait=0.3):
@@ -174,6 +210,7 @@ class G304Reader:
     def read(self):
         try:
             if not self._open():
+                self.fails += 1
                 return None, "未连接"
             # 设备可能不在 1 号槽位，逐个探测电池特性 0x1000
             for di in list(range(1, 7)) + [0xFF]:
@@ -188,12 +225,20 @@ class G304Reader:
                 level = r[4]
                 status = r[5] if len(r) > 5 else 0
                 if 0 <= level <= 100:
+                    self.fails = 0
                     note = "充电中" if status in (1, 2) else "电量"
+                    log("G304: 电量 %d%% %s" % (level, note))
                     return level, note
             self.feat_idx = None
+            self.fails += 1
+            log("G304: 设备不在线 (fails=%d)" % self.fails)
             return None, "鼠标离线"
         except Exception as e:
             return None, f"错误 {e}"
+        finally:
+            if self.dev is not None:
+                close_safe(self.dev)
+                self.dev = None
 
 # ----------------------------- 电量状态聚合 -----------------------------
 
@@ -221,6 +266,7 @@ def make_icon(percents):
 class App:
     def __init__(self):
         self.state = []          # [(name, val, status)]
+        self.cache = {}          # name -> (val, timestamp) 最近一次成功读数
         self.lock = threading.Lock()
         self.icon = None
         self.win = None
@@ -246,8 +292,23 @@ class App:
     # ---- 轮询 ----
     def poll_once(self):
         res = read_all()
+        now = time.time()
         with self.lock:
-            self.state = res
+            out = []
+            for name, v, s in res:
+                if isinstance(v, int):
+                    self.cache[name] = (v, now)
+                    out.append((name, v, s))
+                    continue
+                # 这一轮没读到：6 小时内回落到最后一次真实读数，标记「休眠」
+                hit = self.cache.get(name)
+                if hit and now - hit[1] < 6 * 3600:
+                    val, ts = hit
+                    stamp = time.strftime("%H:%M", time.localtime(ts))
+                    out.append((name, val, "休眠 · %s" % stamp))
+                else:
+                    out.append((name, None, "离线"))
+            self.state = out
             self.last_update = time.strftime("%H:%M:%S")
         self.update_tray()
 
@@ -412,6 +473,19 @@ def already_running():
 quit_flag = False
 
 
+def install_excepthook():
+    """把任何未捕获异常写进日志，避免 --noconsole 下崩溃无声无息。"""
+    import traceback
+
+    def hook(exc_type, exc, tb):
+        log("未捕获异常: " + "".join(
+            traceback.format_exception(exc_type, exc, tb)))
+
+    sys.excepthook = hook
+    threading.excepthook = lambda a: log("线程异常: " + "".join(
+        traceback.format_exception(a.exc_type, a.exc_value, a.exc_traceback)))
+
+
 def main():
     if already_running():
         # 已经有一个在跑了：提示一下就退出，不重复占托盘
@@ -427,6 +501,8 @@ def main():
         autostart.ensure_path_current()
     except Exception:
         pass
+    install_excepthook()
+    log("启动 (startup=%s)" % autostart.is_startup_launch())
     app = App()
     app.run()
 
