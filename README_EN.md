@@ -15,7 +15,7 @@ Platform: Windows 10 / 11
 | Device | Link | How it is read |
 |---|---|---|
 | Akko S9 Ultra headset | GTAI 2.4G dongle (USB VID `36EB` PID `1087`) | Send a query to the HID vendor interface; byte 4 of the reply is the battery % |
-| Lingbao K98 keyboard | Compx/BY solution (USB VID `3554` PID `FA09`) | Read-only feature report `0x06`; byte 3 is the battery % |
+| Lingbao K98 keyboard | Compx/BY solution (USB VID `3554` PID `FA09`) | Send an `0x13` command to make the device push a battery frame; byte 6 is the battery % |
 | Logitech G304 mouse | LIGHTSPEED receiver (USB VID `046D` PID `C53F`) | Standard HID++ 2.0 battery feature `0x1000` |
 
 Devices are matched by **VID/PID**. Same-model devices usually work out of the box; a different production batch may use a different chipset and therefore a different PID.
@@ -54,7 +54,10 @@ No. A sleeping or powered-off mouse is reported as absent by the receiver; that 
 Expected. USB receivers need a moment to enumerate. On autostart the app deliberately waits 15 seconds before the first read, and keeps retrying anyway.
 
 **Does it conflict with the vendor drivers?**
-No. Reads are non-destructive (Logitech/Lingbao are plain reads; the Akko query does not affect playback). Keep the official drivers installed, or uninstall them entirely.
+No. Logitech is a plain read, Akko sends a single query, and Lingbao sends a single status query — none of them change any setting. Keep the official drivers installed, or uninstall them entirely.
+
+**Why is the keyboard not stuck at a round 100%?**
+The `0x64` (=100) values inside the K98 feature report `0x06` are **fixed firmware parameters, not the battery level** — reading them shows 100% forever. The real level lives in the `13 0A` frame the device pushes on its own (e.g. `13 0a 01 00 04 05 62 10` → `04 05` is 4.05 V, `0x62` is 98%). The app sends one `0x05` status query to make the device push that frame immediately, so you see real values like 95% or 99%.
 
 **Refresh rate?**
 Every 30 seconds in the background, automatically shortened to 8 seconds while any device is unreachable. "Refresh now" forces an update.

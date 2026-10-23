@@ -6,10 +6,15 @@
   - 灵豹 K98 键盘       (Compx/BY 方案, VID 0x3554 PID 0xFA09)
   - 罗技 G304 鼠标      (LIGHTSPEED 接收器, VID 0x046D PID 0xC53F)
 
-协议说明：
+  协议说明：
   Akko : 发 output report [0x02,0x12,0x01,0x00...] + 校验尾 71 12，
          响应 [02 12 01 00 <电量%>] （响应尾为设备计算，无需校验）
-  K98  : 读 feature report 0x06 (usage page 0xFF04)，data[3]=电量%，纯只读
+  K98  : 走 output report 0x13（usage page 0xFF02），帧格式 [13 cmd ... checksum]，
+         校验 = 前面所有字节求和取低 8 位。
+         设备每约 11 秒自发推送一帧 [13 0A 01 00 04 05 <电量%> 10 ...]，
+         发 cmd 0x05 可以让它立刻补发一帧（比死等推送快得多）。
+         注意：feature report 0x06（0xFF04）三个 0x64 是固件固定参数，不是电量，
+         照它读会永远显示 100%。
   G304 : HID++ 2.0 标准电池特性 0x1000（BATTERY_LEVEL_STATUS），
          鼠标深度休眠/关机时接收器报 UNKNOWN_DEVICE，显示为离线
 """
@@ -37,6 +42,12 @@ LOGI_VID, LOGI_PID = 0x046D, 0xC53F
 
 APP_NAME = "WirelessBatteryTray"
 
+# 最近一次有效读数落盘，重启/开机后先显示「休眠 · 上次时间」而不是干巴巴的「离线」
+CACHE_DIR = os.path.join(os.environ.get("LOCALAPPDATA") or os.path.expanduser("~"),
+                         "WirelessBatteryTray")
+CACHE_PATH = os.path.join(CACHE_DIR, "last_readings.json")
+
+
 # ----------------------------- 运行日志 -----------------------------
 # 写到 %TEMP%\WirelessBatteryTray.log，排查「读不到/显示离线」时先看这里
 LOG_PATH = os.path.join(os.environ.get("TEMP") or ".", "WirelessBatteryTray.log")
@@ -44,8 +55,34 @@ LOG_PATH = os.path.join(os.environ.get("TEMP") or ".", "WirelessBatteryTray.log"
 
 def log(msg):
     try:
+        # 超过 400 KB 就重开一个，避免长期运行把日志撑爆
+        if os.path.exists(LOG_PATH) and os.path.getsize(LOG_PATH) > 400 * 1024:
+            os.replace(LOG_PATH, LOG_PATH + ".1")
         with open(LOG_PATH, "a", encoding="utf-8") as f:
             f.write("[%s] %s\n" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg))
+    except Exception:
+        pass
+
+
+def load_cache():
+    try:
+        import json
+        with open(CACHE_PATH, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        return {k: (int(v[0]), float(v[1])) for k, v in raw.items()
+                if isinstance(v, list) and len(v) == 2}
+    except Exception:
+        return {}
+
+
+def save_cache(cache):
+    try:
+        import json
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        tmp = CACHE_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({k: [v[0], v[1]] for k, v in cache.items()}, f)
+        os.replace(tmp, CACHE_PATH)
     except Exception:
         pass
 
@@ -109,6 +146,7 @@ class AkkoReader:
     def __init__(self):
         self.dev = None
         self.fails = 0      # 连续失败次数，超过阈值强制重连
+        self.last = None    # 上次成功读数，只在这个值变化时写日志
 
     def read(self):
         dev = open_fresh(AKKO_VID, AKKO_PID, 0x008C, 0x0001)
@@ -124,9 +162,13 @@ class AkkoReader:
                     log("AKKO: 写入失败 %s" % e)
                     break
                 for r in drain(dev, 0.08):
-                    if len(r) >= 5 and r[1] == 0x12 and r[2] == 0x01:
+                    # 耳机没开/刚连上时 dongle 会先回一帧电量 0，那是「还没测出来」，
+                    # 直接拿 0 会把樱花染红，所以丢掉继续等
+                    if len(r) >= 5 and r[1] == 0x12 and r[2] == 0x01 and r[4] > 0:
                         self.fails = 0
-                        log("AKKO: 电量 %d%%" % r[4])
+                        if r[4] != self.last:
+                            log("AKKO: 电量 %d%%" % r[4])
+                            self.last = r[4]
                         return r[4], "电量"
             self.fails += 1
             log("AKKO: 无响应 (fails=%d)" % self.fails)
@@ -135,36 +177,62 @@ class AkkoReader:
             close_safe(dev)
 
 # ----------------------------- 灵豹 K98 -----------------------------
+def kb_frame(cmd):
+    """构造 19 字节命令帧：13 <cmd> 00*16 <sum8>。"""
+    body = bytes([0x13, cmd]) + bytes(16)
+    return body + bytes([sum(body) & 0xFF])
+
+
+KB_TRIGGER = kb_frame(0x05)      # 状态查询，设备收到后会顺带推一帧电量
+
 
 class K98Reader:
     name = "灵豹 K98 键盘"
+    TRIES = 2        # 触发轮数
+    WAIT = 2.0       # 每轮等推送帧的时长（秒）；别调太长，免得白刷设备
 
     def __init__(self):
-        self.dev = None
         self.fails = 0
+        self.last = None
 
     def read(self):
-        dev = open_fresh(KB_VID, KB_PID, 0xFF04, 0x0002)
+        dev = open_fresh(KB_VID, KB_PID, 0xFF02, 0x0002)
         if not dev:
             self.fails += 1
             log("K98: 找不到接口 (fails=%d)" % self.fails)
             return None, "未连接"
         try:
-            data = bytes(dev.get_feature_report(0x06, 65))
-        except Exception as e:
+            # 读写必须共用同一个句柄：两个句柄同时读会让推送帧被另一个句柄吞掉
+            best = None
+            for _ in range(self.TRIES):
+                drain(dev, 0.02)        # 清掉上一轮的残留帧
+                try:
+                    dev.write(KB_TRIGGER)
+                except Exception as e:
+                    log("K98: 写入失败 %s" % e)
+                    break
+                for r in drain(dev, self.WAIT):
+                    # 13 0A 01 00 <V高> <V低> <电量%> 10 ...
+                    if len(r) > 6 and r[0] == 0x13 and r[1] == 0x0A:
+                        pct = r[6]
+                        # 链路刚唤醒时会先发一帧 13 0a 01 00 04 02 00 00，
+                        # 电量位是 0，这是「还没测出来」，不能用，继续等下一帧
+                        if 1 <= pct <= 100:
+                            best = pct
+                            break
+                if best is not None:
+                    break
+            if best is not None:
+                self.fails = 0
+                if best != self.last:
+                    log("K98: 电量 %d%%" % best)
+                    self.last = best
+                return best, "电量"
             self.fails += 1
-            log("K98: 读取失败 %s" % e)
-            return None, "通信失败"
+            log("K98: 未收到电量帧 (fails=%d)" % self.fails)
+            return None, "休眠"
         finally:
             close_safe(dev)
-        # 06 <ch> <state> <kb%> <ch2%> <ch3%> <crc...>
-        if len(data) >= 6 and data[0] == 0x06:
-            self.fails = 0
-            log("K98: 电量 %d%%" % data[3])
-            return data[3], "电量"
-        self.fails += 1
-        log("K98: 无响应 (fails=%d)" % self.fails)
-        return None, "无响应"
 
 # ----------------------------- 罗技 G304 (HID++ 2.0) -----------------------------
 
@@ -176,6 +244,7 @@ class G304Reader:
         self.dev = None
         self.feat_idx = None
         self.fails = 0
+        self.last = None
 
     def _open(self):
         # 关键：HID++ 长报文 (report 0x11, 20 字节) 只能写到 usage 0x0002 的接口
@@ -227,7 +296,9 @@ class G304Reader:
                 if 0 <= level <= 100:
                     self.fails = 0
                     note = "充电中" if status in (1, 2) else "电量"
-                    log("G304: 电量 %d%% %s" % (level, note))
+                    if (level, note) != self.last:
+                        log("G304: 电量 %d%% %s" % (level, note))
+                        self.last = (level, note)
                     return level, note
             self.feat_idx = None
             self.fails += 1
@@ -266,7 +337,7 @@ def make_icon(percents):
 class App:
     def __init__(self):
         self.state = []          # [(name, val, status)]
-        self.cache = {}          # name -> (val, timestamp) 最近一次成功读数
+        self.cache = load_cache()   # name -> (val, timestamp) 最近一次成功读数（跨重启保留）
         self.lock = threading.Lock()
         self.icon = None
         self.win = None
@@ -293,10 +364,13 @@ class App:
     def poll_once(self):
         res = read_all()
         now = time.time()
+        changed = False
         with self.lock:
             out = []
             for name, v, s in res:
                 if isinstance(v, int):
+                    if self.cache.get(name, (None,))[0] != v:
+                        changed = True
                     self.cache[name] = (v, now)
                     out.append((name, v, s))
                     continue
@@ -310,6 +384,8 @@ class App:
                     out.append((name, None, "离线"))
             self.state = out
             self.last_update = time.strftime("%H:%M:%S")
+        if changed:
+            save_cache(self.cache)
         self.update_tray()
 
     def poll_loop(self):
@@ -317,14 +393,18 @@ class App:
         # 立刻读会全部显示「离线」。托盘图标已经出来了，只是稍晚出数字。
         if autostart.is_startup_launch():
             time.sleep(autostart.DELAY_SEC)
-        self.poll_once()
+        n = 0
         while True:
+            n += 1
+            self.poll_once()
             # 只要有设备没读到，就用更短的间隔重试，尽快自愈
             with self.lock:
                 missing = any(not isinstance(v, int) for _, v, _ in self.state)
+            if missing:
+                log("轮询 #%d: 有设备未读到，%d 秒后重试" % (n, FAST_INTERVAL))
             time.sleep(FAST_INTERVAL if missing else POLL_INTERVAL)
-            if not quit_flag:
-                self.poll_once()
+            if quit_flag:
+                break
 
     def update_tray(self):
         with self.lock:
@@ -453,6 +533,7 @@ class App:
         t = threading.Thread(target=self.poll_loop, daemon=True)
         t.start()
         self.tray.run(setup=None)
+        log("托盘主循环已退出")
 
 # ----------------------------- 单实例保护 -----------------------------
 _mutex = None
