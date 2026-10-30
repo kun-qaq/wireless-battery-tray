@@ -3,6 +3,7 @@
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%20%2F%2011-0078D6?style=flat-square)](https://github.com/kun-qaq/wireless-battery-tray)
 [![Release](https://img.shields.io/github/v/release/kun-qaq/wireless-battery-tray?style=flat-square&color=2ea043)](https://github.com/kun-qaq/wireless-battery-tray/releases)
 [![Driver](https://img.shields.io/badge/driver-not%20required-9f7aea?style=flat-square)](https://github.com/kun-qaq/wireless-battery-tray)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green?style=flat-square)](LICENSE)
 
 **English** · [简体中文](README.md)
 
@@ -36,6 +37,7 @@ It ships with Akko S9 Ultra, Lingbao K98 and Logitech G304, but **those are just
 - [Project Layout](#layout)
 - [Adding Your Own Device](#add-device)
 - [Disclaimer](#disclaimer)
+- [License](#license)
 
 ---
 
@@ -160,3 +162,13 @@ Devices speaking a public protocol can reuse existing templates (Logitech HID++,
 ## Disclaimer
 
 This project reads battery levels by reverse-engineering the HID communication of vendor drivers. It is for personal learning and device management only. All protocols used here are undocumented and may break after a firmware update. Not affiliated with any manufacturer.
+
+<a id="license"></a>
+
+## License
+
+Released under the **MIT License**. See [LICENSE](LICENSE) for the full text.
+
+Copyright (c) 2026 kun-qaq
+
+You are free to use, copy, modify, merge, publish, distribute, sublicense and sell copies of this software, provided the copyright notice and this permission notice are included. The software is provided "as is", without warranty of any kind.

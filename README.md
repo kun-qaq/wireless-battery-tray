@@ -3,6 +3,7 @@
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%20%2F%2011-0078D6?style=flat-square)](https://github.com/kun-qaq/wireless-battery-tray)
 [![Release](https://img.shields.io/github/v/release/kun-qaq/wireless-battery-tray?style=flat-square&color=2ea043)](https://github.com/kun-qaq/wireless-battery-tray/releases)
 [![Driver](https://img.shields.io/badge/driver-not%20required-9f7aea?style=flat-square)](https://github.com/kun-qaq/wireless-battery-tray)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green?style=flat-square)](LICENSE)
 
 [English](README_EN.md) · **简体中文**
 
@@ -36,6 +37,7 @@
 - [项目结构](#layout)
 - [想支持别的设备？](#add-device)
 - [免责声明](#disclaimer)
+- [许可证](#license)
 
 ---
 
@@ -163,3 +165,13 @@ tools/                     frida 抓包、字符串提取等逆向辅助工具
 ## 免责声明
 
 本项目通过逆向官方驱动的 HID 通信实现电量读取，仅供个人学习与设备管理使用。协议均为非官方 undocumented 接口，固件更新后可能失效。与任何厂商无关联。
+
+<a id="license"></a>
+
+## 许可证
+
+本项目采用 **MIT 许可证**，详见 [LICENSE](LICENSE)。
+
+Copyright (c) 2026 kun-qaq
+
+你可以自由使用、复制、修改、合并、发布、分发、再许可和销售本软件的副本，只需保留版权声明和许可证声明。软件按「原样」提供，不含任何明示或暗示的担保。
