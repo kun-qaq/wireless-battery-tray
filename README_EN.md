@@ -1,14 +1,45 @@
+<div align="center">
+
+[![Platform](https://img.shields.io/badge/platform-Windows%2010%20%2F%2011-0078D6?style=flat-square)](https://github.com/kun-qaq/wireless-battery-tray)
+[![Release](https://img.shields.io/github/v/release/kun-qaq/wireless-battery-tray?style=flat-square&color=2ea043)](https://github.com/kun-qaq/wireless-battery-tray/releases)
+[![Driver](https://img.shields.io/badge/driver-not%20required-9f7aea?style=flat-square)](https://github.com/kun-qaq/wireless-battery-tray)
+
+**English** · [简体中文](README.md)
+
+</div>
+
 # WirelessBatteryTray — Battery Monitor for 2.4G Wireless Devices
 
 A Windows system-tray utility that reads the battery level of 2.4G wireless devices **directly over HID — no vendor driver needed**. Hover the tray icon and the levels are right there.
 
-It ships with Akko S9 Ultra, Lingbao K98 and Logitech G304, but **those are just three examples**. The read logic is organized as "VID/PID + HID read method", so **any 2.4G wireless device can be added** — see [Adding Your Own Device](#adding-your-own-device).
-
-> 中文版请见 [README.md](README.md) — Chinese version.
+It ships with Akko S9 Ultra, Lingbao K98 and Logitech G304, but **those are just three examples**. The read logic is organized as "VID/PID + HID read method", so **any 2.4G wireless device can be added**.
 
 **Prefer a ready-to-run binary?** Grab `WirelessBatteryTray.exe` from [Releases](https://github.com/kun-qaq/wireless-battery-tray/releases) — double-click, no Python needed.
 
-Platform: Windows 10 / 11
+## Features
+
+- **No driver required**: talks HID directly; Logitech G HUB / Akko software may stay installed or be removed entirely
+- **Hover to read**: no window to open, one hover shows every device
+- **Color tells you when to charge**: the petal color reflects the *lowest* battery across all devices
+- **Extensible**: adding a device means writing one reader class — no changes to the UI, tray or autostart code
+- **Start with Windows**: one right-click toggle, three fallback mechanisms
+- **Single instance**: launching it again will never spawn a second tray icon
+
+## Table of Contents
+
+- [Built-in Devices](#builtin-devices)
+- [Usage](#usage)
+- [Icon Color](#icon-color)
+- [FAQ](#faq)
+- [Autostart](#autostart)
+- [Build from Source](#build)
+- [Project Layout](#layout)
+- [Adding Your Own Device](#add-device)
+- [Disclaimer](#disclaimer)
+
+---
+
+<a id="builtin-devices"></a>
 
 ## Built-in Devices (Examples Only)
 
@@ -20,12 +51,16 @@ Platform: Windows 10 / 11
 
 Devices are matched by **VID/PID**. Same-model devices usually work out of the box; a different production batch may use a different chipset and therefore a different PID.
 
+<a id="usage"></a>
+
 ## Usage
 
 1. Run `WirelessBatteryTray.exe` — a cherry blossom icon appears in the tray overflow area (bottom-right).
 2. **Hover** the icon → one line with all devices, e.g. `Headset 81% | Keyboard 100% | Mouse 90%`
 3. **Left-click** → detail window with battery bars and percentages
 4. **Right-click** → menu: Show details / Refresh now / Start with Windows / Quit
+
+<a id="icon-color"></a>
 
 ## Icon Color = "Should I Charge It?"
 
@@ -41,6 +76,8 @@ The tray icon is a cherry blossom; **its petal color reflects the lowest battery
 The **lowest** value wins — one nearly-empty device always shows up in the petal color instead of being masked by two full ones. Hover or open the window to see which device it is.
 
 Thresholds live in `sakura.py` (`PALETTES` and `palette_for()`) if you prefer 40%/20% or anything else.
+
+<a id="faq"></a>
 
 ## FAQ
 
@@ -62,6 +99,8 @@ The `0x64` (=100) values inside the K98 feature report `0x06` are **fixed firmwa
 **Refresh rate?**
 Every 30 seconds in the background, automatically shortened to 8 seconds while any device is unreachable. "Refresh now" forces an update.
 
+<a id="autostart"></a>
+
 ## Autostart
 
 Right-click the tray icon → **Start with Windows**. Three mechanisms are tried in order, and the first success wins (the others are cleaned up so nothing starts twice):
@@ -71,6 +110,8 @@ Right-click the tray icon → **Start with Windows**. Three mechanisms are tried
 3. **`HKCU\...\Run`** registry value: last-resort fallback
 
 Single-instance protection (kernel mutex) means launching it again will not create a second tray icon. If you move the exe, the autostart entry is repaired on the next launch.
+
+<a id="build"></a>
 
 ## Build from Source
 
@@ -87,6 +128,8 @@ pyinstaller --onefile --noconsole --icon "D:/path/to/sakura.ico" \
             --name WirelessBatteryTray wireless_battery_tray.py
 ```
 
+<a id="layout"></a>
+
 ## Project Layout
 
 ```
@@ -99,6 +142,8 @@ probe_*.py                 RE probing scripts, useful when adding devices
 tools/                     frida hooking, string extraction and other RE helpers
 ```
 
+<a id="add-device"></a>
+
 ## Adding Your Own Device
 
 You do not need to touch the UI, tray or autostart code — **just add a reader class**:
@@ -109,6 +154,8 @@ You do not need to touch the UI, tray or autostart code — **just add a reader 
 4. Write a `XxxReader` class modelled on `G304Reader` / `K98Reader` and append it to `READERS`
 
 Devices speaking a public protocol can reuse existing templates (Logitech HID++, Bluetooth HID battery usage page). PRs adding new devices are welcome.
+
+<a id="disclaimer"></a>
 
 ## Disclaimer
 

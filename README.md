@@ -1,14 +1,45 @@
+<div align="center">
+
+[![Platform](https://img.shields.io/badge/platform-Windows%2010%20%2F%2011-0078D6?style=flat-square)](https://github.com/kun-qaq/wireless-battery-tray)
+[![Release](https://img.shields.io/github/v/release/kun-qaq/wireless-battery-tray?style=flat-square&color=2ea043)](https://github.com/kun-qaq/wireless-battery-tray/releases)
+[![Driver](https://img.shields.io/badge/driver-not%20required-9f7aea?style=flat-square)](https://github.com/kun-qaq/wireless-battery-tray)
+
+[English](README_EN.md) · **简体中文**
+
+</div>
+
 # WirelessBatteryTray — 无线设备电量托盘
 
 一个常驻系统托盘的小工具，直接读取 2.4G 无线设备的电量，**不需要打开任何官方驱动软件**。鼠标移到托盘图标上就能看到电量。
 
-内置支持 Akko S9 Ultra 耳机、灵豹 K98 键盘、罗技 G304 鼠标 —— **但这只是三个示例**。项目的读取逻辑是按「VID/PID + HID 读取方式」组织的，**任何 2.4G 无线设备都可以自己加进去**，见文末 [想支持别的设备？](#想支持别的设备)。
-
-平台：Windows 10 / 11
+内置支持 Akko S9 Ultra 耳机、灵豹 K98 键盘、罗技 G304 鼠标 —— **但这只是三个示例**。项目的读取逻辑是按「VID/PID + HID 读取方式」组织的，**任何 2.4G 无线设备都可以自己加进去**。
 
 **不想自己打包？** 到 [Releases](https://github.com/kun-qaq/wireless-battery-tray/releases) 下载 `WirelessBatteryTray.exe`，双击即用。
 
-> English version: [README_EN.md](README_EN.md)（英文版随主版本更新，可能略有滞后）
+## 特性
+
+- **不装驱动**：直接走 HID 读写，官方驱动（罗技 G HUB、Akko 等）装不装都行
+- **悬停即看**：不用点开任何窗口，鼠标一放就是全部设备电量
+- **看颜色就知道要不要充电**：樱花花瓣颜色 = 所有设备里最低的那个电量
+- **可扩展**：加新设备只需写一个 Reader 类，不用碰 UI / 托盘 / 自启逻辑
+- **开机自启**：右键勾选即可，三级降级（计划任务 → 启动文件夹 → 注册表）
+- **单实例保护**：重复双击不会开出第二个托盘图标
+
+## 目录
+
+- [内置支持的设备](#builtin-devices)
+- [使用方法](#usage)
+- [图标颜色含义](#icon-color)
+- [常见问题](#faq)
+- [开机自启](#autostart)
+- [从源码运行 / 打包](#build)
+- [项目结构](#layout)
+- [想支持别的设备？](#add-device)
+- [免责声明](#disclaimer)
+
+---
+
+<a id="builtin-devices"></a>
 
 ## 内置支持的设备（示例）
 
@@ -20,6 +51,8 @@
 
 > 注意：设备是按 **VID/PID** 匹配的。同型号设备理论上直接可用；不同批次若换了方案，PID 可能不同。
 
+<a id="usage"></a>
+
 ## 使用方法
 
 1. 双击 `dist/WirelessBatteryTray.exe`，任务栏右下角 **^ 溢出区** 会出现一朵樱花图标。
@@ -30,6 +63,8 @@
    - 立即刷新
    - 开机自动启动（勾选开关）
    - 退出
+
+<a id="icon-color"></a>
 
 ## 图标颜色 = 该不该充电
 
@@ -45,6 +80,8 @@
 判定用的是三个里**最低**的那个——任何一个快没电都会体现在花瓣颜色上，不会因为另外两个满电而被掩盖。想看具体是哪个设备低，悬停看数字或点开详情窗。
 
 颜色阈值定义在 `sakura.py` 的 `PALETTES` 和 `palette_for()`，觉得 30%/15% 不合适可以自己改。
+
+<a id="faq"></a>
 
 ## 常见问题
 
@@ -66,6 +103,8 @@
 **刷新频率？**
 后台每 30 秒一轮；有设备读不到时自动加速到 8 秒。右键"立即刷新"可手动触发。
 
+<a id="autostart"></a>
+
 ## 开机自启
 
 托盘右键 →「开机自动启动」即可。内部按优先级尝试三种方式，成功一种即止（并清理其他方式，避免重复启动）：
@@ -75,6 +114,8 @@
 3. **注册表 HKCU Run**：兜底
 
 程序有单实例保护（内核互斥体），自启后再手动双击不会开出第二个托盘。移动 exe 位置后下次启动会自动修复自启入口。
+
+<a id="build"></a>
 
 ## 从源码运行 / 打包
 
@@ -90,6 +131,8 @@ pyinstaller --onefile --noconsole --icon "D:/path/to/sakura.ico" \
             --name WirelessBatteryTray wireless_battery_tray.py
 ```
 
+<a id="layout"></a>
+
 ## 项目结构
 
 ```
@@ -102,6 +145,8 @@ probe_*.py                 协议逆向过程的探测脚本，可供新增设�
 tools/                     frida 抓包、字符串提取等逆向辅助工具
 ```
 
+<a id="add-device"></a>
+
 ## 想支持别的设备？
 
 内置的三款设备只是例子。增加新设备不需要改动主程序的 UI、托盘、自启逻辑，**只需要加一个读取类**：
@@ -112,6 +157,8 @@ tools/                     frida 抓包、字符串提取等逆向辅助工具
 4. 写一个 `XxxReader` 类（参照 `G304Reader` / `K98Reader` 的骨架），加进 `READERS` 列表即可
 
 公开协议的设备可以直接套模板（罗技 HID++、蓝牙 HID 电池用法页）。欢迎提 PR 把你的设备加进来。
+
+<a id="disclaimer"></a>
 
 ## 免责声明
 
