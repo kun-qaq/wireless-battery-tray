@@ -470,27 +470,65 @@ class FluentShell:
         return ImageTk.PhotoImage(img)
 
     def _bind_dyn_wrap(self, label, pad=12):
-        """让 Label 的 wraplength 跟随自身实际宽度, 窗口缩放时文字自适应不再被截断。"""
-        _last = {"w": 0}
+        """让说明文字的 wraplength 跟随控件实际宽度, 窗口缩放时自适应不截断。
 
-        def _on(_e):
-            w = label.winfo_width()
-            if w and w != _last["w"]:
-                _last["w"] = w
-                try:
-                    label.configure(wraplength=max(40, w - pad))
-                except Exception:
-                    pass
-
-        label.bind("<Configure>", _on)
+        坑(2026-11-02 修复): 千万别把 <Configure> 绑在 label 自己身上 ——
+        configure(wraplength=...) 会改变 label 高度, 再次触发它自己的
+        <Configure>, 形成无限循环, update_idletasks() 永不返回, 窗口直接
+        「打不开」(而且 --noconsole 下没有任何报错, 托盘线程里还会被吞掉)。
+        改为只监听 root 的 <Configure>(窗口尺寸真变化时才触发), 并把所有
+        说明文字的更新合并到一次 after_idle 里执行, 天然防重入。
+        """
+        if not hasattr(self, "_wrap_labels"):
+            self._wrap_labels = []
+            self._wrap_last = {}
+            self._wrap_scheduled = False
+            try:
+                self.root.bind("<Configure>", self._schedule_wrap, add="+")
+            except Exception:
+                pass
+        self._wrap_labels.append((label, pad))
+        self._schedule_wrap()
         return label
+
+    def _apply_wraps(self):
+        """按控件真实宽度更新所有说明文字的 wraplength(只在宽度变化时 configure)。"""
+        for lbl, pad in list(getattr(self, "_wrap_labels", [])):
+            try:
+                w = lbl.winfo_width()
+                if w > 30 and self._wrap_last.get(id(lbl)) != w:
+                    self._wrap_last[id(lbl)] = w
+                    lbl.configure(wraplength=max(40, w - pad))
+            except Exception:
+                pass
+
+    def _schedule_wrap(self, _e=None):
+        """窗口尺寸变化 / 新增说明文字时, 合并成一次延迟更新(80ms 节流)。"""
+        if self._wrap_scheduled:
+            return
+        self._wrap_scheduled = True
+
+        def _do():
+            self._wrap_scheduled = False
+            self._apply_wraps()
+
+        # 必须用 after(ms) 定时器, 绝不能用 after_idle:
+        # after_idle 回调会在 update_idletasks() 里被立即执行, 而回调里的
+        # configure(wraplength) 又会产生新的 idle/Configure 任务, 令
+        # update_idletasks() 永远清不空队列 -> 主线程卡死、窗口打不开。
+        # after(80) 只在正常事件循环(mainloop)里按时间触发, 且自带节流。
+        try:
+            self.root.after(80, _do)
+        except Exception:
+            self._wrap_scheduled = False
 
     def _apply_window(self):
         """Win11 原生深色标题栏(失败静默)。"""
         if pywinstyles is None:
             return
         try:
-            self.root.update_idletasks()
+            # 别在这里 update_idletasks(): 启动期调用会执行所有已排队的
+            # after/idle 回调, 周期性 after 会自我续期导致 idle 队列清不空 -> 卡死。
             ver = sys.getwindowsversion()
             if ver.major == 10 and ver.build >= 22000:
                 pywinstyles.change_header_color(self.root, self.P["bg"])
@@ -921,7 +959,9 @@ class FluentShell:
                     w.configure(**kw)
             except Exception:
                 pass
-        self.root.update_idletasks()
+        # 不调用 update_idletasks(): 主题切换可能来自 after(0) 回调, 在里面
+        # 再强制刷 idle 同样会让业务层周期性 after 无限续期 -> 卡死。
+        # 换色只是 configure, 让 mainloop 的下一次绘制自然生效即可。
 
     def track(self, widget, fg="text", bg="card"):
         """登记一个原生 tk 控件, 换主题时自动换色(fg/bg 传 None 则跳过那一项)。
@@ -934,9 +974,31 @@ class FluentShell:
 
     # ---------------------------------------------------------- 启动
     def mainloop(self):
-        self.root.update_idletasks()
-        self._apply_window()
+        # 启动路径绝不调用 update_idletasks(): 它会立刻执行所有已排队的
+        # after / idle 回调, 业务层的周期性 after 轮询(如拼豆的 _start_poll)
+        # 会不断自我续期, 令 idle 队列永远清不空 -> 主线程卡死、窗口打不开。
+        # 窗口布局、映射、定时器全部交给下面的 mainloop() 自己按事件循环处理。
+        self._apply_wraps()          # 首帧换行(窗口未映射时宽度为 1 会跳过,
+                                     # 由 80ms 定时器在映射后补上, 文字不会截断)
+        # 内置诊断: 设 FLUENT_PROBE=路径 则走到这里(完整启动路径已跑通)就写标记
+        # 并退出, 不进 mainloop、不依赖显示器。用于 CI / 无头环境确认窗口构建没卡死。
+        _probe = os.environ.get("FLUENT_PROBE")
+        if _probe:
+            try:
+                with open(_probe, "w", encoding="utf-8") as _f:
+                    _f.write("WINDOW_BUILD_OK title=%s mode=%s pages=%d wraps=%d\n" % (
+                        self._title, self.mode, len(self.pages),
+                        len(getattr(self, "_wrap_labels", []))))
+            except Exception:
+                pass
+            try:
+                self.root.destroy()
+            except Exception:
+                pass
+            return
         self.root.after(80, self._drain)
+        # 标题栏配色等窗口映射后(HWND 有效)再异步做, 不在启动期同步阻塞
+        self.root.after(100, self._apply_window)
         # 测试钩子: 设了环境变量 FLUENT_SHOT 就在 1.8s 后截屏退出(平时不生效)
         shot = os.environ.get("FLUENT_SHOT")
         if shot:
