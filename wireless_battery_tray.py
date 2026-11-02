@@ -444,7 +444,7 @@ class App:
             subtitle="无线设备电量详情",
             pages=[("dev", "设备电量", "每 30 秒自动刷新"),
                    ("about", "说明", "托盘菜单里可开启开机自启")],
-            width=560, height=540, icon=icon, builder=self._build_window)
+            width=560, height=540, mode="system", icon=icon, builder=self._build_window)
         self.shell = shell
         self.win = shell.root
         try:

@@ -29,13 +29,16 @@ FluentShell v3 —— 真正的 Windows 11 风格图形界面骨架（可复用�
     app.mainloop()
 
 约定: 深色 #1c1c1c / 卡片 #2b2b2b / 强调色跟随 Sun Valley 主题 (#57c8ff)
-      字体: Segoe UI Variable Text / Display (不存在时自动回退 Segoe UI)
-      中文自动回退 Microsoft YaHei UI
+      字体: 思源黑体 (Source Han Sans) / 其开源发行版 Noto Sans SC
+            (两者字形完全一致; 机器上装了哪个用哪个, 都没装再回退微软雅黑)
+      mode="system" 时跟随 Windows 系统深浅色, 并监听系统切换自动变更
 """
 import os
 import queue
 import re
 import sys
+import threading
+import time
 import tkinter as tk
 from tkinter import font as tkfont
 from tkinter import ttk
@@ -46,6 +49,11 @@ try:
     import pywinstyles
 except Exception:                                     # 非 Windows / 没装也照样能跑
     pywinstyles = None
+
+try:
+    import darkdetect                                 # 跟随系统深浅色(Windows/Mac)
+except Exception:                                     # 没装也能跑(默认深色)
+    darkdetect = None
 
 from PIL import Image, ImageTk
 
@@ -260,9 +268,9 @@ class _Segmented(ttk.Frame):
     def _pick(self, i):
         v = self.values[i]
         if self.var.get() != v:
-            self.var.set(v)
-        elif self.command:
-            self.command(v)
+            self.var.set(v)          # 改选中项 -> trace 更新高亮
+        if self.command:
+            self.command(v)          # 始终触发回调(否则换选项后说明/预览要再点一次才更新)
 
     def _sync(self):
         cur = self.var.get()
@@ -291,7 +299,7 @@ class _Progress(ttk.Progressbar):
 # ------------------------------------------------------------------ 主骨架
 class FluentShell:
     def __init__(self, title="App", app_name="App", subtitle="", pages=(),
-                 width=1040, height=720, mode="dark", icon=None, builder=None,
+                 width=1040, height=720, mode="system", icon=None, builder=None,
                  footer=None):
         """
         pages:   [(key, 导航标题, 页面副标题), ...]
@@ -299,6 +307,10 @@ class FluentShell:
         builder: 建内容的回调 builder(self)(内容只会建一次; 换主题不再重建窗口)
         footer:  左下角小字(比如版本号)
         """
+        # mode="system" 时跟随 Windows 系统深浅色, 并监听系统切换自动变更
+        self._auto_follow = (mode == "system")
+        if self._auto_follow:
+            mode = self._detect_system_mode()
         self.mode = mode
         self.P = DARK if mode == "dark" else LIGHT
         self.pages = list(pages) or [("home", "主页", "")]
@@ -330,6 +342,8 @@ class FluentShell:
         self._build_content()
         if builder:
             builder(self)
+        if self._auto_follow:
+            self._start_theme_watchdog()
 
     # ---------------------------------------------------------- 字体 / 样式
     def _setup_fonts(self):
@@ -341,10 +355,12 @@ class FluentShell:
                     return c
             return cands[-1]
 
-        # 关键: 不要用 Segoe UI Variable! 它是可变字体, Tk/GDI 渲染中文又糊又粗。
-        # Win11 中文界面实际用的就是 Microsoft YaHei UI, 清晰干净, 中英文都好看。
-        self.f_ui = pick("Microsoft YaHei UI", "微软雅黑", "DengXian",
-                         "等线", "Microsoft JhengHei UI", "Segoe UI")
+        # 设计字体: 思源黑体 (Source Han Sans) 及其开源发行版 Noto Sans SC,
+        # 两者字形完全一致, 机器装了哪个用哪个; 都没装再回退微软雅黑等。
+        # 注意: 不要用 Segoe UI Variable! 它是可变字体, Tk/GDI 渲染中文又糊又粗。
+        self.f_ui = pick("Source Han Sans SC", "Source Han Sans", "思源黑体",
+                         "Noto Sans SC", "微软雅黑", "Microsoft YaHei UI",
+                         "DengXian", "等线", "Microsoft JhengHei UI", "Segoe UI")
         self.f_disp = self.f_ui
         self.f_mono_name = ("Cascadia Mono" if "Cascadia Mono" in fams
                             else "Consolas" if "Consolas" in fams
@@ -375,7 +391,12 @@ class FluentShell:
         st = self.style
         st.configure("Page.TFrame", background=P["bg"])
         st.configure("Nav.TFrame", background=P["bg"])
-        st.configure("Card.TFrame", background=P["card"])
+        # Card: 用主题可控的「实心背景」, 这样和卡片内的标签/文字背景永远同色。
+        # sv_ttk 自带的 Card.TFrame 是烘焙死的图片元素, 深色下还会渲染异常(变白),
+        # 所以这里改用 Frame.border 实心填充 + 1px 细描边(提供层次)。
+        st.layout("Card.TFrame", [("Frame.border", {"sticky": "nswe"})])
+        st.configure("Card.TFrame", background=P["card"], borderwidth=1,
+                     relief="solid", bordercolor=P["border"])
         st.configure("Tool.TFrame", background=P["card"])
         st.configure("Seg.TButton", padding=(16, 5), anchor="center")
         st.configure("Sub.TLabel", background=P["card"], foreground=P["sub"],
@@ -475,7 +496,7 @@ class FluentShell:
                 anchor="w", padx=24, pady=(0, 16))
 
     def _dummy_var(self):
-        v = tk.BooleanVar(value=False)
+        v = tk.BooleanVar(value=(self.mode == "light"))
         self._theme_var = v
         return v
 
@@ -752,7 +773,63 @@ class FluentShell:
         _in_()
 
     # ---------------------------------------------------------- 主题切换
+    def _detect_system_mode(self):
+        """读系统深浅色: Windows 看 Personalize.AppsUseLightTheme, 其他平台靠 darkdetect。
+        调试用: 设 FLUENT_FORCE_MODE=light/dark 可强制某个主题(不设置则跟随系统)。"""
+        forced = os.environ.get("FLUENT_FORCE_MODE")
+        if forced in ("light", "dark"):
+            return forced
+        if darkdetect is None:
+            return "dark"
+        try:
+            t = darkdetect.theme()
+        except Exception:
+            return "dark"
+        return "light" if t and t.lower() == "light" else "dark"
+
+    def _apply_mode(self, mode):
+        """真正执行主题切换(供手动切换与系统监听调用)。"""
+        if mode not in ("dark", "light") or mode == self.mode:
+            return
+        self.mode = mode
+        self.P = DARK if mode == "dark" else LIGHT
+        sv_ttk.set_theme(mode)
+        self._setup_fonts()
+        self._setup_styles()
+        self.root.configure(bg=self.P["bg"])
+        self._refresh()
+        self._apply_window()
+        try:
+            self._theme_var.set(mode == "light")
+        except Exception:
+            pass
+
+    def _start_theme_watchdog(self):
+        """后台轮询系统主题(每 2s), 变化时自动切换(仅自动跟随模式下)。"""
+        if darkdetect is None:
+            return
+        last = self._detect_system_mode()
+
+        def loop():
+            nonlocal last
+            while self._auto_follow:
+                time.sleep(2)
+                try:
+                    cur = self._detect_system_mode()
+                except Exception:
+                    continue
+                if cur != last and self._auto_follow:
+                    last = cur
+                    try:
+                        self.root.after(0, self._apply_mode, cur)
+                    except Exception:
+                        pass
+
+        threading.Thread(target=loop, daemon=True).start()
+
     def switch_mode(self):
+        """手动切换深浅色(切一次后停止跟随系统)。"""
+        self._auto_follow = False
         self.mode = "light" if self.mode == "dark" else "dark"
         self.P = DARK if self.mode == "dark" else LIGHT
         sv_ttk.set_theme(self.mode)
@@ -808,16 +885,23 @@ class FluentShell:
 
     def _debug_shot(self, path):
         try:
-            import ctypes
-            from ctypes import wintypes
             from PIL import ImageGrab
             self.root.update_idletasks()
             self.root.update()
-            hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id())
-            rect = wintypes.RECT()
-            ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(rect))
-            ImageGrab.grab(bbox=(rect.left, rect.top, rect.right, rect.bottom),
-                           all_screens=True).save(path)
+            # 提到最前, 避免被其它窗口遮挡导致截到背景
+            self.root.lift()
+            try:
+                self.root.attributes("-topmost", True)
+            except Exception:
+                pass
+            self.root.update()
+            time.sleep(0.3)
+            # 用逻辑坐标(winfo_rootx/width)截, 避免高 DPI 下物理/逻辑错位
+            x = self.root.winfo_rootx()
+            y = self.root.winfo_rooty()
+            w = self.root.winfo_width()
+            h = self.root.winfo_height()
+            ImageGrab.grab(bbox=(x, y, x + w, y + h)).save(path)
         except Exception as e:
             print("shot fail:", e)
         self.root.destroy()
