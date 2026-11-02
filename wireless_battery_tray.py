@@ -23,8 +23,6 @@ import os
 import sys
 import threading
 import time
-import tkinter as tk
-from tkinter import font as tkfont
 
 import hid
 from PIL import Image, ImageDraw, ImageFont
@@ -32,6 +30,7 @@ import pystray
 
 import autostart
 import sakura
+from fluent_shell import FluentShell
 
 # ----------------------------- 配置 -----------------------------
 POLL_INTERVAL = 30          # 正常轮询间隔（秒）
@@ -427,7 +426,7 @@ class App:
             except Exception:
                 pass
 
-    # ---- 详情窗口 ----
+    # ---- 详情窗口 (Win11 Fluent: 每设备一张卡片 + 电量条) ----
     def show_window(self, *_):
         if self.win is not None:
             try:
@@ -436,65 +435,92 @@ class App:
                 return
             except Exception:
                 self.win = None
-        win = tk.Tk()
-        win.title("无线设备电量")
-        win.geometry("380x300")
-        win.configure(bg="#1e1e2e")
-        win.attributes("-topmost", True)
-        win.protocol("WM_DELETE_WINDOW", lambda: (win.destroy(), setattr(self, "win", None)))
         try:
-            from PIL import ImageTk
-            self._win_icon = ImageTk.PhotoImage(sakura.draw_sakura(64))
-            win.iconphoto(True, self._win_icon)
+            icon = sakura.draw_sakura(64)
+        except Exception:
+            icon = None
+        shell = FluentShell(
+            title="无线设备电量", app_name="电量",
+            subtitle="无线设备电量详情",
+            pages=[("dev", "设备电量", "每 30 秒自动刷新"),
+                   ("about", "说明", "托盘菜单里可开启开机自启")],
+            width=560, height=540, icon=icon, builder=self._build_window)
+        self.shell = shell
+        self.win = shell.root
+        try:
+            self.win.attributes("-topmost", True)
+            self.win.protocol("WM_DELETE_WINDOW", self._close_window)
         except Exception:
             pass
-        f_big = tkfont.Font(size=13, weight="bold")
-        f_mid = tkfont.Font(size=11)
-        f_small = tkfont.Font(size=9)
-        self.lbls = []
-        for i in range(3):
-            fr = tk.Frame(win, bg="#2a2a3c", padx=12, pady=10)
-            fr.pack(fill="x", padx=14, pady=6)
-            name_l = tk.Label(fr, text="", bg="#2a2a3c", fg="#eaeaf0", font=f_big, anchor="w")
-            name_l.pack(fill="x")
-            val_l = tk.Label(fr, text="", bg="#2a2a3c", fg="#9ecbff", font=f_mid, anchor="w")
-            val_l.pack(fill="x")
-            bar = tk.Canvas(fr, height=10, bg="#3a3a4e", highlightthickness=0, bd=0)
-            bar.pack(fill="x", pady=(4, 0))
-            # 窗口尺寸/布局变化时重画，保证条长、条高与实际画布一致
-            bar.bind("<Configure>", lambda _e: self.refresh_window_labels())
-            self.lbls.append((name_l, val_l, bar))
-        foot = tk.Label(win, text="", bg="#1e1e2e", fg="#888", font=f_small)
-        foot.pack(pady=4)
-        self.foot = foot
-        self.win = win
         self.refresh_window_labels()
-        win.mainloop()
+        shell.mainloop()
+
+    def _close_window(self):
+        try:
+            self.win.destroy()
+        except Exception:
+            pass
+        self.win = None
+        self.shell = None
+        self.lbls = []
+        self.foot = None
+
+    def _build_window(self, app):
+        """每个设备一张卡片: 名称 + 电量文字 + 电量条。"""
+        p = app.page("dev")
+        self.lbls = []
+        rows = max(3, len(self.state))
+        for _ in range(rows):
+            c = app.card(p)
+            c.pack(fill="x", padx=24, pady=8)
+            name_l = app.label(c, text="", font=app.f_h2, role="text")
+            name_l.pack(fill="x", padx=20, pady=(14, 2))
+            val_l = app.label(c, text="", font=app.f_body, role="sub")
+            val_l.pack(fill="x", padx=20, pady=(0, 8))
+            pg = app.progress(c)
+            pg.pack(fill="x", padx=20, pady=(0, 16))
+            self.lbls.append((name_l, val_l, pg))
+
+        bar = app.hbox(p, style="Page.TFrame")
+        bar.pack(fill="x", padx=24, pady=4)
+        app.btn(bar, "立即刷新", lambda: (self.poll_once(), None)).pack(side="left")
+
+        self.foot = app.label(p, text="", font=app.f_small, role="sub", bg="bg")
+        self.foot.pack(fill="x", padx=28, pady=(6, 12))
+
+        p2 = app.page("about")
+        ca = app.card(p2, "说明")
+        ca.pack(fill="x", padx=24, pady=6)
+        app.sublabel(ca, "托盘图标上的花瓣颜色随最低电量变化。\n"
+                         "设备休眠时显示最后一次真实读数（6 小时内有效）。\n"
+                         "在托盘图标右键菜单里可切换开机自动启动。")
 
     def refresh_window_labels(self):
-        if self.win is None:
+        if self.win is None or not self.lbls:
             return
         with self.lock:
             res = list(self.state)
         for i, (name, v, s) in enumerate(res):
-            name_l, val_l, bar = self.lbls[i]
-            name_l.config(text=name)
-            w, h = bar.winfo_width(), bar.winfo_height()
-            bar.delete("all")
+            if i >= len(self.lbls):
+                break
+            name_l, val_l, pg = self.lbls[i]
+            name_l.configure(text=name)
             if not isinstance(v, int):
-                val_l.config(text=s, fg="#888")
+                val_l.configure(text=s, foreground="#9e9e9e")
+                self.shell.progress_color(pg, "#3a3a3a")
+                pg.set(0)
                 continue
             color = "#4caf50" if v > 30 else ("#ffc107" if v > 15 else "#f44336")
-            val_l.config(text=f"{v}%   {s}", fg=color)
-            # 画布尚未布局完成时先不画条（Configure 事件会触发重画）
-            if w < 20 or h < 4:
-                continue
-            # 背景槽铺满整个画布，再按电量比例画填充，宽高都用实际渲染尺寸
-            bar.create_rectangle(0, 0, w, h, fill="#3a3a4e", width=0)
-            fill_w = max(4, round(w * min(100, max(0, v)) / 100))
-            bar.create_rectangle(0, 0, fill_w, h, fill=color, width=0)
-        if self.foot and self.last_update:
-            self.foot.config(text=f"上次刷新 {self.last_update}")
+            val_l.configure(text=f"{v}%   {s}", foreground=color)
+            self.shell.progress_color(pg, color)
+            pg.set(min(1.0, max(0.0, v / 100)))
+        for j in range(len(res), len(self.lbls)):      # 多余的行清空
+            name_l, val_l, pg = self.lbls[j]
+            name_l.configure(text="")
+            val_l.configure(text="")
+            pg.set(0)
+        if self.foot is not None and self.last_update:
+            self.foot.configure(text=f"上次刷新 {self.last_update}")
 
     # ---- 开机自启 ----
     def toggle_startup(self, *_):
