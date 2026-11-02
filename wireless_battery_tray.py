@@ -444,7 +444,7 @@ class App:
             subtitle="无线设备电量详情",
             pages=[("dev", "设备电量", "每 30 秒自动刷新"),
                    ("about", "说明", "托盘菜单里可开启开机自启")],
-            width=560, height=540, mode="system", icon=icon, builder=self._build_window)
+            width=560, height=600, mode="system", icon=icon, builder=self._build_window)
         self.shell = shell
         self.win = shell.root
         try:
@@ -471,14 +471,14 @@ class App:
         self.lbls = []
         rows = max(3, len(self.state))
         for _ in range(rows):
-            c = app.card(p)
+            c = app.card(p, padding=12)
             c.pack(fill="x", padx=24, pady=8)
             name_l = app.label(c, text="", font=app.f_h2, role="text")
-            name_l.pack(fill="x", padx=20, pady=(14, 2))
+            name_l.pack(fill="x", padx=20, pady=(10, 2))
             val_l = app.label(c, text="", font=app.f_body, role="sub")
-            val_l.pack(fill="x", padx=20, pady=(0, 8))
+            val_l.pack(fill="x", padx=20, pady=(0, 6))
             pg = app.progress(c)
-            pg.pack(fill="x", padx=20, pady=(0, 16))
+            pg.pack(fill="x", padx=20, pady=(0, 12))
             self.lbls.append((name_l, val_l, pg))
 
         bar = app.hbox(p, style="Page.TFrame")

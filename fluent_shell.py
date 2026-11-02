@@ -122,8 +122,11 @@ class _ScrollPage(ttk.Frame):
         self._win = self.canvas.create_window((0, 0), window=self.body,
                                               anchor="nw")
         self.canvas.configure(yscrollcommand=self.sb.set)
+        # 滚动条用 place 浮在画布右侧, 不占网格列 —— 这样它显隐不会改变画布宽度,
+        # 避免「显示滚动条→画布变窄→正文折行变高→真的需要滚动」的死循环。
         self.canvas.grid(row=0, column=0, sticky="nsew")
-        self.sb.grid(row=0, column=1, sticky="ns")
+        self.sb.place(relx=1.0, rely=0, relheight=1, width=14, anchor="ne")
+        self.sb.place_forget()  # 默认隐藏, 需要时再显示
         self.body.bind("<Configure>", lambda e: self._sync_scroll())
         self.canvas.bind("<Configure>", self._on_cfg)
         self.canvas.bind("<Enter>", lambda e: self.canvas.bind_all(
@@ -137,11 +140,12 @@ class _ScrollPage(ttk.Frame):
 
     def _sync_scroll(self):
         self.canvas.configure(scrollregion=self.canvas.bbox("all"))
-        need = self.body.winfo_reqheight() > self.canvas.winfo_height() + 2
+        # 容差放宽到 12px: 内容只差几像素时不显示滚动条, 避免"轻微溢出"误触发
+        need = self.body.winfo_reqheight() > self.canvas.winfo_height() + 12
         if need:
-            self.sb.grid()
+            self.sb.place(relx=1.0, rely=0, relheight=1, width=14, anchor="ne")
         else:
-            self.sb.grid_remove()
+            self.sb.place_forget()
 
     def _wheel(self, e):
         self.canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
@@ -323,6 +327,7 @@ class FluentShell:
         self._size = (width, height)
         self._dyn = []                       # 需要跟着主题换色的 (控件, 选项, key)
         self._q = queue.Queue()
+        self._card_r = 10                     # 卡片圆角半径(px)
 
         self.root = tk.Tk()
         self.root.title(title)
@@ -391,12 +396,32 @@ class FluentShell:
         st = self.style
         st.configure("Page.TFrame", background=P["bg"])
         st.configure("Nav.TFrame", background=P["bg"])
-        # Card: 用主题可控的「实心背景」, 这样和卡片内的标签/文字背景永远同色。
-        # sv_ttk 自带的 Card.TFrame 是烘焙死的图片元素, 深色下还会渲染异常(变白),
-        # 所以这里改用 Frame.border 实心填充 + 1px 细描边(提供层次)。
-        st.layout("Card.TFrame", [("Frame.border", {"sticky": "nswe"})])
-        st.configure("Card.TFrame", background=P["card"], borderwidth=1,
-                     relief="solid", bordercolor=P["border"])
+        # Card: 圆角卡片, 用 9-patch borderimage(主题感知, 深/浅各一张图)。
+        # 不用 sv_ttk 自带的 Card.TFrame —— 那是烘焙死的图片, 深色偶尔渲染异常(变白);
+        # 也不用品直角的实心 Frame(太生硬, 用户要圆角)。这里用 PIL 画圆角图作 borderimage,
+        # 深浅色各生成一次, 换主题时只切布局, 卡片内的标签背景(P[card])与卡片同色所以无缝。
+        if not hasattr(self, "_card_bmp"):
+            self._card_bmp = {}
+        for _m in ("dark", "light"):
+            if self._card_bmp.get(_m) is None:
+                self._card_bmp[_m] = self._make_card_bitmap(_m, self._card_r)
+        if self._card_bmp.get("dark") is None and self._card_bmp.get("light") is None:
+            # PIL 不可用: 退回直角实心卡片(兜底)
+            st.layout("Card.TFrame", [("Frame.border", {"sticky": "nswe"})])
+            st.configure("Card.TFrame", background=P["card"], borderwidth=1,
+                         relief="solid", bordercolor=P["border"])
+        else:
+            for _m in ("dark", "light"):
+                _el = "Card.%s.field" % _m
+                if _el not in st.element_names():
+                    try:
+                        st.element_create(_el, "image", self._card_bmp[_m],
+                                          border=self._card_r, sticky="nsew")
+                    except Exception:
+                        pass
+            _cur = "Card.%s.field" % self.mode
+            st.layout("Card.TFrame", [(_cur, {"sticky": "nsew"})])
+            st.configure("Card.TFrame", borderwidth=0, relief="flat")
         st.configure("Tool.TFrame", background=P["card"])
         st.configure("Seg.TButton", padding=(16, 5), anchor="center")
         st.configure("Sub.TLabel", background=P["card"], foreground=P["sub"],
@@ -428,6 +453,37 @@ class FluentShell:
 
     def set_icon(self, pil_image):
         self._apply_icon(pil_image)
+
+    def _make_card_bitmap(self, mode, r=10):
+        """画一张 (2r+1)x(2r+1) 的圆角卡片图, 当作 ttk 的 borderimage(9-patch) 用。"""
+        P = DARK if mode == "dark" else LIGHT
+        try:
+            from PIL import Image, ImageTk, ImageDraw
+        except Exception:
+            return None
+        s = 2 * r + 1
+        img = Image.new("RGBA", (s, s), (0, 0, 0, 0))
+        d = ImageDraw.Draw(img)
+        d.rounded_rectangle([0, 0, s - 1, s - 1], radius=r, fill=P["card"])
+        d.rounded_rectangle([1, 1, s - 2, s - 2], radius=max(0, r - 1),
+                            outline=P["border"], width=1)
+        return ImageTk.PhotoImage(img)
+
+    def _bind_dyn_wrap(self, label, pad=12):
+        """让 Label 的 wraplength 跟随自身实际宽度, 窗口缩放时文字自适应不再被截断。"""
+        _last = {"w": 0}
+
+        def _on(_e):
+            w = label.winfo_width()
+            if w and w != _last["w"]:
+                _last["w"] = w
+                try:
+                    label.configure(wraplength=max(40, w - pad))
+                except Exception:
+                    pass
+
+        label.bind("<Configure>", _on)
+        return label
 
     def _apply_window(self):
         """Win11 原生深色标题栏(失败静默)。"""
@@ -590,16 +646,16 @@ class FluentShell:
 
     def sublabel(self, parent, text):
         l = ttk.Label(parent, text=text, style="Sub.TLabel", anchor="w",
-                      wraplength=760, justify="left")
+                      justify="left")
         l.pack(fill="x", pady=(2, 6))
-        return l
+        return self._bind_dyn_wrap(l)
 
     def hint(self, parent, text):
         """页面级(背景色)说明文字。"""
         l = ttk.Label(parent, text=text, style="Hint.TLabel", anchor="w",
-                      wraplength=760, justify="left")
+                      justify="left")
         l.pack(fill="x", pady=(2, 6))
-        return l
+        return self._bind_dyn_wrap(l)
 
     def hbox(self, parent, style="Tool.TFrame", **kw):
         """横向排按钮的容器。卡片里用默认; 直接放页面上传 style='Page.TFrame'。"""
@@ -626,8 +682,10 @@ class FluentShell:
         box.pack(side="left", fill="x", expand=True)
         ttk.Label(box, text=text, style="Body.TLabel").pack(fill="x")
         if desc:
-            ttk.Label(box, text=desc, style="Sub.TLabel", anchor="w",
-                      wraplength=620, justify="left").pack(fill="x")
+            dl = ttk.Label(box, text=desc, style="Sub.TLabel", anchor="w",
+                           justify="left")
+            dl.pack(fill="x")
+            self._bind_dyn_wrap(dl)
         self.toggle(r, "", var).pack(side="right")
         return r
 
@@ -640,8 +698,10 @@ class FluentShell:
             box.pack(side="left", fill="x", expand=True)
             ttk.Label(box, text=text, style="Body.TLabel").pack(fill="x")
             if desc:
-                ttk.Label(box, text=desc, style="Sub.TLabel", anchor="w",
-                          wraplength=620, justify="left").pack(fill="x")
+                dl = ttk.Label(box, text=desc, style="Sub.TLabel", anchor="w",
+                               justify="left")
+                dl.pack(fill="x")
+                self._bind_dyn_wrap(dl)
         return r
 
     def entry(self, parent, placeholder="", width=220, justify="left"):
