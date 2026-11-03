@@ -104,6 +104,55 @@ def _mix(c1, c2, t):
     return "#%02x%02x%02x" % tuple(int(a[i] + (b[i] - a[i]) * t) for i in range(3))
 
 
+class _CardBody(tk.Frame):
+    """卡片的内容框。
+
+    它的真身在 Canvas 里(create_window 嵌入), 圆角由 Canvas 画, 所以自己没有边框;
+    但业务代码拿到的就是它(往里 pack 控件), 因此 pack/grid/place 一律转发给外层容器。
+
+    为什么不用 ttk 的 borderimage 圆角(2026-11-03 实测):
+        ttk 的 9-patch image element 每次重绘都要重新缩放采样整张图,
+        单张卡片一次重绘 ≈ 0.4s; 7 张卡片首帧 3.1s, CPU 直接跑满单核,
+        窗口迟迟画不出来 —— 表现就是「双击没反应、界面很卡」。
+        Canvas 画 6 个图元只要 0.05s(和普通 Frame 同级), 视觉完全一致。
+    """
+
+    _outer = None
+    _shell = None
+
+    # ---- 几何管理器: 一律作用到外层占位容器上
+    def pack(self, *a, **kw):
+        if self._outer is not None:
+            return self._outer.pack(*a, **kw)
+        return super().pack(*a, **kw)
+
+    pack_configure = pack
+
+    def grid(self, *a, **kw):
+        if self._outer is not None:
+            return self._outer.grid(*a, **kw)
+        return super().grid(*a, **kw)
+
+    grid_configure = grid
+
+    def place(self, *a, **kw):
+        if self._outer is not None:
+            return self._outer.place(*a, **kw)
+        return super().place(*a, **kw)
+
+    place_configure = place
+
+    def pack_forget(self):
+        if self._outer is not None:
+            return self._outer.pack_forget()
+        return super().pack_forget()
+
+    def grid_forget(self):
+        if self._outer is not None:
+            return self._outer.grid_forget()
+        return super().grid_forget()
+
+
 # ------------------------------------------------------------------ 滚动页面
 class _ScrollPage(ttk.Frame):
     """单个可滚动页面: Canvas + 内部 body 框架(往 body 里塞卡片)。"""
@@ -341,14 +390,28 @@ class FluentShell:
         self._footer = footer
         self._size = (width, height)
         self._dyn = []                       # 需要跟着主题换色的 (控件, 选项, key)
+        self._cards = []                     # 圆角卡片登记表(换主题时重画)
         self._q = queue.Queue()
         self._drain_id = None
         self._card_r = 10                     # 卡片圆角半径(px)
 
         self.root = tk.Tk()
         self.root.title(title)
-        self.root.geometry(f"{width}x{height}")
-        self.root.minsize(max(560, width - 160), max(420, height - 120))
+        # 窗口尺寸不能盲目用请求值: 用户机器可能是 1080p + 150% 缩放,
+        # 1060x760 会渲染成 ~1590x1140 物理像素 —— 超出屏幕, 标题栏跑到屏幕外,
+        # 表现就是「双击了但看不到窗口」。这里按实际可用区域钳制并居中。
+        try:
+            scale = float(self.root.tk.call("tk", "scaling")) / (96.0 / 72.0)
+        except Exception:
+            scale = 1.0
+        sw = int(self.root.winfo_screenwidth() / max(scale, 0.1))
+        sh = int(self.root.winfo_screenheight() / max(scale, 0.1))
+        max_w, max_h = int(sw * 0.94), int(sh * 0.86)   # 留出任务栏/标题栏
+        w, h = min(width, max_w), min(height, max_h)
+        x = max(0, (sw - w) // 2)
+        y = max(0, (sh - h) // 2 - int(sh * 0.02))
+        self.root.geometry(f"{w}x{h}+{x}+{y}")
+        self.root.minsize(min(560, w), min(420, h))
         self.root.configure(bg=self.P["bg"])
         self.root.grid_columnconfigure(1, weight=1)
         self.root.grid_rowconfigure(0, weight=1)
@@ -416,32 +479,13 @@ class FluentShell:
         st = self.style
         st.configure("Page.TFrame", background=P["bg"])
         st.configure("Nav.TFrame", background=P["bg"])
-        # Card: 圆角卡片, 用 9-patch borderimage(主题感知, 深/浅各一张图)。
-        # 不用 sv_ttk 自带的 Card.TFrame —— 那是烘焙死的图片, 深色偶尔渲染异常(变白);
-        # 也不用品直角的实心 Frame(太生硬, 用户要圆角)。这里用 PIL 画圆角图作 borderimage,
-        # 深浅色各生成一次, 换主题时只切布局, 卡片内的标签背景(P[card])与卡片同色所以无缝。
-        if not hasattr(self, "_card_bmp"):
-            self._card_bmp = {}
-        for _m in ("dark", "light"):
-            if self._card_bmp.get(_m) is None:
-                self._card_bmp[_m] = self._make_card_bitmap(_m, self._card_r)
-        if self._card_bmp.get("dark") is None and self._card_bmp.get("light") is None:
-            # PIL 不可用: 退回直角实心卡片(兜底)
-            st.layout("Card.TFrame", [("Frame.border", {"sticky": "nswe"})])
-            st.configure("Card.TFrame", background=P["card"], borderwidth=1,
-                         relief="solid", bordercolor=P["border"])
-        else:
-            for _m in ("dark", "light"):
-                _el = "Card.%s.field" % _m
-                if _el not in st.element_names():
-                    try:
-                        st.element_create(_el, "image", self._card_bmp[_m],
-                                          border=(self._card_r,) * 4)
-                    except Exception:
-                        pass
-            _cur = "Card.%s.field" % self.mode
-            st.layout("Card.TFrame", [(_cur, {"sticky": "nsew"})])
-            st.configure("Card.TFrame", borderwidth=0, relief="flat")
+        # Card: 圆角由 Canvas 现画(见 card()), 这里只留一个直角实心兜底样式,
+        # 给外部仍然直接写 style="Card.TFrame" 的地方用。
+        # 注意: 千万别再用 borderimage 9-patch 做圆角 —— ttk 每次重绘都会重新
+        # 缩放采样整张图, 单张卡片 ≈0.4s, 几张就要几秒, UI 直接卡死(实测)。
+        st.layout("Card.TFrame", [("Frame.border", {"sticky": "nswe"})])
+        st.configure("Card.TFrame", background=P["card"], borderwidth=1,
+                     relief="solid", bordercolor=P["border"])
         st.configure("Tool.TFrame", background=P["card"])
         st.configure("Seg.TButton", padding=(16, 5), anchor="center")
         st.configure("Sub.TLabel", background=P["card"], foreground=P["sub"],
@@ -475,21 +519,6 @@ class FluentShell:
 
     def set_icon(self, pil_image):
         self._apply_icon(pil_image)
-
-    def _make_card_bitmap(self, mode, r=10):
-        """画一张 (2r+1)x(2r+1) 的圆角卡片图, 当作 ttk 的 borderimage(9-patch) 用。"""
-        P = DARK if mode == "dark" else LIGHT
-        try:
-            from PIL import Image, ImageTk, ImageDraw
-        except Exception:
-            return None
-        s = 2 * r + 3
-        img = Image.new("RGBA", (s, s), (0, 0, 0, 0))
-        d = ImageDraw.Draw(img)
-        d.rounded_rectangle([0, 0, s - 1, s - 1], radius=r, fill=P["card"])
-        d.rounded_rectangle([1, 1, s - 2, s - 2], radius=max(0, r - 1),
-                            outline=P["border"], width=1)
-        return ImageTk.PhotoImage(img)
 
     def _bind_dyn_wrap(self, label, pad=12):
         """让说明文字的 wraplength 跟随控件实际宽度, 窗口缩放时自适应不截断。
@@ -691,11 +720,79 @@ class FluentShell:
 
     # ---------------------------------------------------------- 控件
     def card(self, parent, title=None, padding=16):
-        f = ttk.Frame(parent, style="Card.TFrame", padding=padding)
+        """圆角卡片。返回的对象可以直接 pack/grid, 也可以当父容器放控件。
+
+        实现: 一个 Canvas 当卡片本体(自己画圆角背景), 内容框用 create_window 嵌进去。
+        Canvas 每帧只画十几个图元, 重绘成本和普通 Frame 同级; 而 ttk 的 borderimage
+        9-patch 每次重绘都要重新缩放采样整张图 —— 实测单张卡片 0.4s, 7 张卡片首帧
+        3.1s, CPU 直接跑满单核, 窗口迟迟画不出来(表现为「双击没反应/很卡」)。
+
+        高度自适应: 内容框高度变化时用 after(16) 延迟改 canvas 高度。绝不能用
+        同步 configure 或 after_idle —— 高度变化会再触发内容框 <Configure>,
+        形成自引用, update_idletasks()/update() 会卡在里面出不来。
+        """
+        P, r = self.P, self._card_r
+        # 初始高度必须容得下内容框的起点(padding), 否则内容框不会被映射,
+        # 它就不会触发 <Configure>, 高度永远停在 1px —— 卡片整块看不见。
+        cv = tk.Canvas(parent, bg=P["bg"], bd=0, highlightthickness=0,
+                       takefocus=0, height=2 * padding + 2)
+        body = _CardBody(cv, bg=P["card"], bd=0, highlightthickness=0)
+        body._outer, body._shell = cv, self
+        win = cv.create_window(padding, padding, anchor="nw", window=body)
+        rec = {"canvas": cv, "body": body, "win": win, "pad": padding,
+               "w": -1, "h": -1, "pending": False}
+        self._cards.append(rec)
+
+        def repaint():
+            w, h = rec["w"], rec["h"]
+            if w < 4 or h < 4:
+                return
+            cv.delete("cardbg")
+            for i in _round_rect(cv, 0, 0, w - 1, h - 1, r, fill=P["border"]):
+                cv.addtag_withtag("cardbg", i)
+            for i in _round_rect(cv, 1, 1, w - 2, h - 2, max(0, r - 1),
+                                 fill=P["card"]):
+                cv.addtag_withtag("cardbg", i)
+            cv.tag_lower("cardbg")     # 压到内容框下面
+        rec["repaint"] = repaint
+
+        def apply_height():
+            rec["pending"] = False
+            try:
+                need = body.winfo_reqheight() + 2 * padding
+                if abs(need - cv.winfo_reqheight()) > 2:
+                    cv.configure(height=need)
+            except Exception:
+                pass
+
+        def on_body(_e=None):
+            # after(16) 而不是 after_idle: 定时器不参与 update_idletasks 的
+            # idle 队列, 也不会在 update() 里被反复立即执行 -> 天然断开自引用。
+            if rec["pending"]:
+                return
+            rec["pending"] = True
+            try:
+                self.root.after(16, apply_height)
+            except Exception:
+                rec["pending"] = False
+
+        def on_canvas(e):
+            if e.width == rec["w"] and e.height == rec["h"]:
+                return
+            rec["w"], rec["h"] = e.width, e.height
+            cv.itemconfigure(win, width=max(40, e.width - 2 * padding))
+            repaint()
+            on_body()        # 宽度变了, 文字重新折行 -> 高度可能也要变
+
+        cv.bind("<Configure>", on_canvas)
+        body.bind("<Configure>", on_body)
+
         if title:
-            ttk.Label(f, text=title, style="CardTitle.TLabel").pack(
-                fill="x", pady=(0, 6))
-        return f
+            tl = ttk.Label(body, text=title, style="CardTitle.TLabel",
+                           background=P["card"])
+            self._dyn.append((tl, "foreground", "text", "background", "card"))
+            tl.pack(fill="x", pady=(0, 6))
+        return body
 
     def label(self, parent, text="", role="text", font=None, anchor="w",
               bg=None, **kw):
@@ -711,15 +808,20 @@ class FluentShell:
         return l
 
     def sublabel(self, parent, text):
+        # 背景必须用实例级 background, 不能只靠 style: sv_ttk 在窗口映射时会
+        # 重新套一遍主题, 把 style 里的 background 重置回页面底色, 卡片上就会
+        # 出现一条比卡底更深的横条。实例选项不会被主题覆盖。
         l = ttk.Label(parent, text=text, style="Sub.TLabel", anchor="w",
-                      justify="left")
+                      justify="left", background=self.P["card"])
+        self._dyn.append((l, "foreground", "sub", "background", "card"))
         l.pack(fill="x", pady=(2, 6))
         return self._bind_dyn_wrap(l)
 
     def hint(self, parent, text):
         """页面级(背景色)说明文字。"""
         l = ttk.Label(parent, text=text, style="Hint.TLabel", anchor="w",
-                      justify="left")
+                      justify="left", background=self.P["bg"])
+        self._dyn.append((l, "foreground", "sub", "background", "bg"))
         l.pack(fill="x", pady=(2, 6))
         return self._bind_dyn_wrap(l)
 
@@ -1018,6 +1120,14 @@ class FluentShell:
         for pg in self.page_frames.values():
             pg.apply_bg(P["bg"])
             pg.body.configure(style="Page.TFrame")
+        # 圆角卡片: 换主题要重画底色/描边, 并把内容框和画布底色一起换掉
+        for rec in list(self._cards):
+            try:
+                rec["canvas"].configure(bg=P["bg"])
+                rec["body"].configure(bg=P["card"])
+                rec["repaint"]()
+            except Exception:
+                pass
         for w, fgopt, fkey, bgopt, bkey in self._dyn:
             try:
                 kw = {}

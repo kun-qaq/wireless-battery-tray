@@ -696,7 +696,8 @@ def install_excepthook():
 
 
 def main():
-    if already_running():
+    window_only = "--window" in sys.argv[1:]
+    if not window_only and already_running():
         # 已经有一个在跑了：提示一下就退出，不重复占托盘
         try:
             ctypes.windll.user32.MessageBoxW(
@@ -713,6 +714,17 @@ def main():
     install_excepthook()
     log("启动 (startup=%s)" % autostart.is_startup_launch())
     app = App()
+    # --window: 只显示窗口、不占托盘(也用于快速自检打包后的界面)
+    if "--window" in sys.argv[1:]:
+        try:
+            app.poll_once()          # 先同步读一次, 窗口一出来就有数字
+        except Exception:
+            pass
+        threading.Thread(target=app.poll_loop, daemon=True).start()
+        app.show_window()
+        if app.ui_thread is not None:
+            app.ui_thread.join()
+        return
     app.run()
 
 
