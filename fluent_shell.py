@@ -115,6 +115,7 @@ class _ScrollPage(ttk.Frame):
         self.rowconfigure(0, weight=1)
         self.canvas = tk.Canvas(self, highlightthickness=0, bd=0,
                                 bg=shell.P["bg"])
+        self.canvas.bind("<MouseWheel>", self._wheel)
         self.sb = ttk.Scrollbar(self, orient="vertical",
                                 command=self.canvas.yview)
         self.body = ttk.Frame(self.canvas, style="Page.TFrame",
@@ -127,25 +128,39 @@ class _ScrollPage(ttk.Frame):
         self.canvas.grid(row=0, column=0, sticky="nsew")
         self.sb.place(relx=1.0, rely=0, relheight=1, width=14, anchor="ne")
         self.sb.place_forget()  # 默认隐藏, 需要时再显示
-        self.body.bind("<Configure>", lambda e: self._sync_scroll())
+        self._canvas_width = None
+        self._scroll_sync_id = None
+        self.body.bind("<Configure>", lambda e: self._schedule_scroll_sync())
         self.canvas.bind("<Configure>", self._on_cfg)
-        self.canvas.bind("<Enter>", lambda e: self.canvas.bind_all(
-            "<MouseWheel>", self._wheel))
-        self.canvas.bind("<Leave>", lambda e: self.canvas.unbind_all(
-            "<MouseWheel>"))
 
     def _on_cfg(self, e):
-        self.canvas.itemconfigure(self._win, width=e.width)
-        self._sync_scroll()
+        if e.width != self._canvas_width:
+            self._canvas_width = e.width
+            self.canvas.itemconfigure(self._win, width=e.width)
+        self._schedule_scroll_sync()
+
+    def _schedule_scroll_sync(self):
+        if self._scroll_sync_id is not None:
+            return
+        try:
+            self._scroll_sync_id = self.after(80, self._sync_scroll)
+        except Exception:
+            pass
 
     def _sync_scroll(self):
-        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
-        # 容差放宽到 12px: 内容只差几像素时不显示滚动条, 避免"轻微溢出"误触发
-        need = self.body.winfo_reqheight() > self.canvas.winfo_height() + 12
-        if need:
-            self.sb.place(relx=1.0, rely=0, relheight=1, width=14, anchor="ne")
-        else:
-            self.sb.place_forget()
+        self._scroll_sync_id = None
+        try:
+            if not self.canvas.winfo_exists():
+                return
+            self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+            # 容差放宽到 12px: 内容只差几像素时不显示滚动条, 避免"轻微溢出"误触发
+            need = self.body.winfo_reqheight() > self.canvas.winfo_height() + 12
+            if need:
+                self.sb.place(relx=1.0, rely=0, relheight=1, width=14, anchor="ne")
+            else:
+                self.sb.place_forget()
+        except Exception:
+            pass          # 窗口正在销毁时 bbox 会抛 TclError, 忽略即可
 
     def _wheel(self, e):
         self.canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
@@ -327,6 +342,7 @@ class FluentShell:
         self._size = (width, height)
         self._dyn = []                       # 需要跟着主题换色的 (控件, 选项, key)
         self._q = queue.Queue()
+        self._drain_id = None
         self._card_r = 10                     # 卡片圆角半径(px)
 
         self.root = tk.Tk()
@@ -339,6 +355,10 @@ class FluentShell:
         self.style = ttk.Style()
 
         sv_ttk.set_theme(mode)
+        # Keep all widgets on Sun Valley. Switching to clam from a per-widget
+        # progress color silently replaces the app theme and breaks ttk layouts.
+        self._progress_styles = set()
+        self._last_root_geometry = None
         self._setup_fonts()
         self._setup_styles()
         self._apply_icon(icon)
@@ -416,7 +436,7 @@ class FluentShell:
                 if _el not in st.element_names():
                     try:
                         st.element_create(_el, "image", self._card_bmp[_m],
-                                          border=self._card_r, sticky="nsew")
+                                          border=(self._card_r,) * 4)
                     except Exception:
                         pass
             _cur = "Card.%s.field" % self.mode
@@ -433,9 +453,11 @@ class FluentShell:
         st.configure("CardTitle.TLabel", background=P["card"],
                      foreground=P["text"], font=self.f_h2)
         st.configure("HC.Horizontal.TProgressbar", background=P["accent"],
-                     troughcolor=_mix(P["card"], P["bg"], .5))
+                     troughcolor=_mix(P["card"], P["bg"], .5),
+                     bordercolor=P["border"])
         st.configure("HC.Vertical.TProgressbar", background=P["accent"],
-                     troughcolor=_mix(P["card"], P["bg"], .5))
+                     troughcolor=_mix(P["card"], P["bg"], .5),
+                     bordercolor=P["border"])
 
     # ---------------------------------------------------------- 窗口外观
     def _apply_icon(self, icon):
@@ -461,7 +483,7 @@ class FluentShell:
             from PIL import Image, ImageTk, ImageDraw
         except Exception:
             return None
-        s = 2 * r + 1
+        s = 2 * r + 3
         img = Image.new("RGBA", (s, s), (0, 0, 0, 0))
         d = ImageDraw.Draw(img)
         d.rounded_rectangle([0, 0, s - 1, s - 1], radius=r, fill=P["card"])
@@ -504,12 +526,30 @@ class FluentShell:
 
     def _schedule_wrap(self, _e=None):
         """窗口尺寸变化 / 新增说明文字时, 合并成一次延迟更新(80ms 节流)。"""
+        if _e is not None:
+            if getattr(_e, "widget", None) is not self.root:
+                return
+            try:
+                geom = (self.root.winfo_width(), self.root.winfo_height())
+                if geom == self._last_root_geometry:
+                    return
+                self._last_root_geometry = geom
+            except Exception:
+                return
+            if getattr(self, "_wrap_after_id", None) is not None:
+                try:
+                    self.root.after_cancel(self._wrap_after_id)
+                except Exception:
+                    pass
+                self._wrap_scheduled = False
         if self._wrap_scheduled:
             return
         self._wrap_scheduled = True
+        self._wrap_after_id = None
 
         def _do():
             self._wrap_scheduled = False
+            self._wrap_after_id = None
             self._apply_wraps()
 
         # 必须用 after(ms) 定时器, 绝不能用 after_idle:
@@ -518,7 +558,7 @@ class FluentShell:
         # update_idletasks() 永远清不空队列 -> 主线程卡死、窗口打不开。
         # after(80) 只在正常事件循环(mainloop)里按时间触发, 且自带节流。
         try:
-            self.root.after(80, _do)
+            self._wrap_after_id = self.root.after(300, _do)
         except Exception:
             self._wrap_scheduled = False
 
@@ -639,23 +679,11 @@ class FluentShell:
                 f.place_forget()
             new.place(x=0, y=0, relwidth=1, relheight=1)
             return
-        n = 9
-
-        def step(i):
-            if i == 0:
-                old.place(x=0, y=0, relwidth=1, relheight=1)
-                new.place(x=34, y=0, relwidth=1, relheight=1)
-                new.lift()
-            t = i / n
-            ease = 1 - (1 - t) ** 3
-            new.place(x=int((1 - ease) * 34), y=0, relwidth=1, relheight=1)
-            old.place(x=-int(ease * 34), y=0, relwidth=1, relheight=1)
-            if i < n:
-                self.page_host.after(14, lambda: step(i + 1))
-            else:
-                old.place_forget()
-                new.place(x=0, y=0, relwidth=1, relheight=1)
-        step(0)
+        # Page bodies contain native widgets and canvases. Sliding two complete
+        # trees triggers expensive redraws; switch the visible page atomically.
+        for f in self.page_frames.values():
+            f.place_forget()
+        new.place(x=0, y=0, relwidth=1, relheight=1)
 
     def page(self, key):
         """取页面容器(往里塞卡片)。"""
@@ -703,8 +731,32 @@ class FluentShell:
         """给进度条单独换色(如电量绿/黄/红), 自动生成一个临时样式。"""
         name = "pc" + color.lstrip("#").lower()
         st = name + ".Horizontal.TProgressbar"
-        self.style.configure(st, background=color)
+        if st not in self._progress_styles:
+            pbar = name + ".pbar"
+            if pbar not in self.style.element_names():
+                self.style.element_create(
+                    pbar, "image", self._make_progress_image(color),
+                    border=2, sticky="ew")
+            self.style.layout(st, [
+                ("Horizontal.Progressbar.trough", {"sticky": "nswe", "children": [
+                    (pbar, {"side": "left", "sticky": "ns"})
+                ]})
+            ])
+            self._progress_styles.add(st)
+        self.style.configure(st)
         pg.configure(style=st)
+
+    def _make_progress_image(self, color):
+        # Tk image-backed ttk element: unlike Sun Valley's sprite, this has the
+        # requested battery color and cannot show stale green/yellow overlays.
+        key = (self.mode, color)
+        cache = getattr(self, "_progress_images", None)
+        if cache is None:
+            cache = self._progress_images = {}
+        if key not in cache:
+            image = Image.new("RGBA", (12, 8), color)
+            cache[key] = ImageTk.PhotoImage(image)
+        return cache[key]
 
     def btn(self, parent, text, cmd, primary=False, width=None):
         b = ttk.Button(parent, text=text, command=cmd,
@@ -817,13 +869,30 @@ class FluentShell:
     def ui(self, fn):
         """后台线程更新界面一律走这里, 避免 RuntimeError。"""
         self._q.put(fn)
+        self._wake_drain()
 
     def log(self, msg, textbox=None):
         if textbox is None:
             return
         self._q.put((textbox, str(msg)))
+        self._wake_drain()
+
+    def _wake_drain(self):
+        """有任务入队时才唤醒一次 drain。
+
+        原来的 mainloop 里挂了一个 80ms 永久自续的 after, 每秒唤醒 12 次
+        却几乎永远拿不到任务 —— 空转本身就会持续打断 Tk 的事件循环,
+        窗口拖动/滚动时有明显掉帧。改成按需唤醒后队列空时 CPU 占用为 0。
+        """
+        if self._drain_id is not None:
+            return
+        try:
+            self._drain_id = self.root.after(15, self._drain)
+        except Exception:
+            self._drain_id = None
 
     def _drain(self):
+        self._drain_id = None
         try:
             while True:
                 item = self._q.get_nowait()
@@ -840,7 +909,8 @@ class FluentShell:
                     pass
         except queue.Empty:
             pass
-        self.root.after(80, self._drain)
+        if not self._q.empty():
+            self._wake_drain()
 
     # ---------------------------------------------------------- Toast
     def toast(self, text, ok=True):
@@ -996,8 +1066,6 @@ class FluentShell:
             except Exception:
                 pass
             return
-        self.root.after(80, self._drain)
-        # 标题栏配色等窗口映射后(HWND 有效)再异步做, 不在启动期同步阻塞
         self.root.after(100, self._apply_window)
         # 测试钩子: 设了环境变量 FLUENT_SHOT 就在 1.8s 后截屏退出(平时不生效)
         shot = os.environ.get("FLUENT_SHOT")

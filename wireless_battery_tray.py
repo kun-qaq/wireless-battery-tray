@@ -340,7 +340,20 @@ class App:
         self.lock = threading.Lock()
         self.icon = None
         self.win = None
+        self.shell = None
+        self.lbls = []
+        self.foot = None
         self.last_update = None
+        self.ui_thread = None
+        self._ui_snapshot = None
+        # 窗口常驻 + 按需刷新: 不再用 40ms 定时器轮询事件标志
+        self._show_requested = False
+        self._visible = False
+        self._data_version = 0
+        self._rendered = {}
+        self._rendered_rows = 0
+        self._rendered_version = -1
+        self._last_tray_state = None
         self.startup_mode = autostart.startup_mode()
 
         self.tray = pystray.Icon(
@@ -349,7 +362,7 @@ class App:
             title="无线设备电量 · 正在读取…",
             menu=pystray.Menu(
                 pystray.MenuItem("显示电量详情", self.show_window, default=True),
-                pystray.MenuItem("立即刷新", lambda: (self.poll_once(), None)),
+                pystray.MenuItem("立即刷新", self.request_refresh),
                 pystray.MenuItem(
                     lambda _: f"开机自动启动 · {autostart.describe(self.startup_mode)}",
                     self.toggle_startup,
@@ -408,6 +421,14 @@ class App:
     def update_tray(self):
         with self.lock:
             res = list(self.state)
+            last_update = self.last_update
+            changed = res != self._last_tray_state
+            if changed:
+                self._last_tray_state = res
+        self._ui_snapshot = (res, last_update)
+        self._data_version += 1
+        if not changed:
+            return
         # Windows 托盘 tooltip 是单行，用短名拼接
         short = {"Akko S9 耳机": "耳机", "灵豹 K98 键盘": "键盘", "罗技 G304 鼠标": "鼠标"}
         parts = []
@@ -420,50 +441,88 @@ class App:
             self.tray.icon = make_icon(res)
         except Exception:
             pass
-        if self.win is not None:
-            try:
-                self.win.after(0, self.refresh_window_labels)
-            except Exception:
-                pass
 
     # ---- 详情窗口 (Win11 Fluent: 每设备一张卡片 + 电量条) ----
     def show_window(self, *_):
+        """托盘点击: 窗口常驻, 只是隐藏/显示, 不再每次重建整个界面。"""
+        self._show_requested = True
+        if self.ui_thread is None or not self.ui_thread.is_alive():
+            self.ui_thread = threading.Thread(
+                target=self._run_window, name="BatteryWindow", daemon=True)
+            self.ui_thread.start()
+
+    def preload_window(self):
+        """启动后预先建好窗口(隐藏), 第一次点托盘也能立刻出来。"""
         if self.win is not None:
-            try:
-                self.win.deiconify()
-                self.win.lift()
-                return
-            except Exception:
-                self.win = None
+            return
+        if self.ui_thread is not None and self.ui_thread.is_alive():
+            return
+        self.ui_thread = threading.Thread(
+            target=self._run_window, name="BatteryWindow", daemon=True)
+        self.ui_thread.start()
+
+    def _run_window(self):
         try:
             icon = sakura.draw_sakura(64)
         except Exception:
             icon = None
-        shell = FluentShell(
-            title="无线设备电量", app_name="电量",
-            subtitle="无线设备电量详情",
-            pages=[("dev", "设备电量", "每 30 秒自动刷新"),
-                   ("about", "说明", "托盘菜单里可开启开机自启")],
-            width=560, height=600, mode="system", icon=icon, builder=self._build_window)
-        self.shell = shell
-        self.win = shell.root
         try:
-            self.win.attributes("-topmost", True)
-            self.win.protocol("WM_DELETE_WINDOW", self._close_window)
-        except Exception:
-            pass
-        self.refresh_window_labels()
-        shell.mainloop()
+            shell = FluentShell(
+                title="无线设备电量", app_name="电量",
+                subtitle="无线设备电量详情",
+                pages=[("dev", "设备电量", "每 30 秒自动刷新"),
+                       ("about", "说明", "托盘菜单里可开启开机自启")],
+                width=560, height=600, mode="system", icon=icon,
+                builder=self._build_window)
+            shell.switch("dev", anim=False)
+            self.shell = shell
+            self.win = shell.root
+            self.win.protocol("WM_DELETE_WINDOW", self._hide_window)
+            self._rendered.clear()
+            self._rendered_rows = 0
+            self._rendered_version = -1
+            self._refresh_labels()        # 先填好内容再显示, 避免白屏一闪
+            self.win.withdraw()
+            self.win.after(60, self._ui_tick)
+            shell.mainloop()
+        except Exception as e:
+            log("窗口线程异常: %r" % (e,))
+            self.win = None
+            self.shell = None
 
-    def _close_window(self):
+    def _ui_tick(self):
+        """低频心跳: 平时 1 秒一次只看两个变量, 点开窗口后短暂提速到 120ms。
+
+        旧实现是 40ms 永久轮询 25 次/秒, 一直占用事件循环, 拖动窗口明显掉帧。
+        """
+        win = self.win
+        if win is None:
+            return
+        if self._show_requested:
+            self._show_requested = False
+            try:
+                win.deiconify()
+                win.lift()
+                win.focus_force()
+                self._visible = True
+            except Exception:
+                pass
+        if self._data_version != self._rendered_version:
+            self._rendered_version = self._data_version
+            self._refresh_labels()
+        # 可见时 110ms(操作跟手), 隐藏时 250ms(点开窗口的响应上限, 开销可忽略)
         try:
-            self.win.destroy()
+            win.after(110 if self._visible else 250, self._ui_tick)
         except Exception:
             pass
-        self.win = None
-        self.shell = None
-        self.lbls = []
-        self.foot = None
+
+    def _hide_window(self):
+        """关闭按钮只隐藏: 下次点托盘秒开, 也不丢当前页面。"""
+        self._visible = False
+        try:
+            self.win.withdraw()
+        except Exception:
+            pass
 
     def _build_window(self, app):
         """每个设备一张卡片: 名称 + 电量文字 + 电量条。"""
@@ -483,7 +542,7 @@ class App:
 
         bar = app.hbox(p, style="Page.TFrame")
         bar.pack(fill="x", padx=24, pady=4)
-        app.btn(bar, "立即刷新", lambda: (self.poll_once(), None)).pack(side="left")
+        app.btn(bar, "立即刷新", self.request_refresh).pack(side="left")
 
         self.foot = app.label(p, text="", font=app.f_small, role="sub", bg="bg")
         self.foot.pack(fill="x", padx=28, pady=(6, 12))
@@ -495,32 +554,72 @@ class App:
                          "设备休眠时显示最后一次真实读数（6 小时内有效）。\n"
                          "在托盘图标右键菜单里可切换开机自动启动。")
 
-    def refresh_window_labels(self):
+    def _refresh_labels(self):
+        """差分刷新: 只动真正变化的控件。
+
+        原来每轮都把名称/数值/颜色/进度条全量 configure 一遍, 而
+        progress_color 里还要重设 ttk 样式, 3 张卡一次就是十几次 Tk 调用。
+        数据 30 秒才更新一次, 而且通常只有一两个数字变了。
+        """
         if self.win is None or not self.lbls:
             return
-        with self.lock:
-            res = list(self.state)
+        snapshot = self._ui_snapshot
+        if snapshot is None:
+            with self.lock:
+                res = list(self.state)
+            last_update = self.last_update
+        else:
+            res, last_update = snapshot
+
         for i, (name, v, s) in enumerate(res):
             if i >= len(self.lbls):
                 break
             name_l, val_l, pg = self.lbls[i]
-            name_l.configure(text=name)
-            if not isinstance(v, int):
-                val_l.configure(text=s, foreground="#9e9e9e")
-                self.shell.progress_color(pg, "#3a3a3a")
-                pg.set(0)
+            if isinstance(v, int):
+                text = f"{v}%   {s}"
+                color = "#4caf50" if v > 30 else ("#ffc107" if v > 15 else "#f44336")
+                pct = min(1.0, max(0.0, v / 100))
+            else:
+                text, color, pct = s, "#9e9e9e", 0.0
+            old = self._rendered.get(i)
+            if old == (name, text, color, pct):
                 continue
-            color = "#4caf50" if v > 30 else ("#ffc107" if v > 15 else "#f44336")
-            val_l.configure(text=f"{v}%   {s}", foreground=color)
-            self.shell.progress_color(pg, color)
-            pg.set(min(1.0, max(0.0, v / 100)))
-        for j in range(len(res), len(self.lbls)):      # 多余的行清空
-            name_l, val_l, pg = self.lbls[j]
-            name_l.configure(text="")
-            val_l.configure(text="")
-            pg.set(0)
-        if self.foot is not None and self.last_update:
-            self.foot.configure(text=f"上次刷新 {self.last_update}")
+            if old is None or old[0] != name:
+                name_l.configure(text=name)
+            if old is None or old[1] != text or old[2] != color:
+                val_l.configure(text=text, foreground=color)
+            if old is None or old[2] != color:
+                self.shell.progress_color(pg, color)
+            if old is None or old[3] != pct:
+                pg.set(pct)
+            self._rendered[i] = (name, text, color, pct)
+
+        if self._rendered_rows > len(res):          # 行数变少时清掉多余行
+            for j in range(len(res), min(self._rendered_rows, len(self.lbls))):
+                name_l, val_l, pg = self.lbls[j]
+                name_l.configure(text="")
+                val_l.configure(text="")
+                pg.set(0)
+                self._rendered.pop(j, None)
+        self._rendered_rows = len(res)
+
+        if self.foot is not None and last_update:
+            ft = f"上次刷新 {last_update}"
+            if getattr(self, "_rendered_foot", None) != ft:
+                self._rendered_foot = ft
+                self.foot.configure(text=ft)
+
+    def request_refresh(self):
+        """Do HID I/O off the UI thread; publish results through poll_once()."""
+        if getattr(self, "_refreshing", False):
+            return
+        self._refreshing = True
+        def run():
+            try:
+                self.poll_once()
+            finally:
+                self._refreshing = False
+        threading.Thread(target=run, name="BatteryRefresh", daemon=True).start()
 
     # ---- 开机自启 ----
     def toggle_startup(self, *_):
@@ -556,8 +655,11 @@ class App:
         sys.exit(0)
 
     def run(self):
-        t = threading.Thread(target=self.poll_loop, daemon=True)
-        t.start()
+        threading.Thread(target=self.poll_loop, daemon=True).start()
+        # 托盘出来后再预建窗口(隐藏), 这样第一次点「显示电量详情」也是秒开
+        pre = threading.Timer(1.5, self.preload_window)
+        pre.daemon = True
+        pre.start()
         self.tray.run(setup=None)
         log("托盘主循环已退出")
 
